@@ -1,0 +1,26 @@
+{
+  "name": "coinpj",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node main.js",
+    "start:once": "set RUN_ONCE=true&& node main.js",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "supabase:login": "npx supabase login",
+    "supabase:link": "npx supabase link --project-ref algqbpberjlwbkpvosbl",
+    "db:push": "npx supabase db push"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.103.3",
+    "axios": "^1.15.0",
+    "dotenv": "^17.4.2",
+    "jsonwebtoken": "^9.0.3",
+    "node-cron": "^4.2.1",
+    "uuid": "^13.0.0"
+  }
+}
