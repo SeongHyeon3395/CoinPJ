@@ -90,6 +90,25 @@ async function sellMarket(market, volume) {
     }
 }
 
+// 지정가 매도 함수
+async function sellLimit(market, volume, price) {
+    const body = {
+        market: market,
+        side: 'ask', // 매도
+        volume: volume, // 매도 수량
+        price: String(price), // 지정가
+        ord_type: 'limit' // 지정가 매도
+    };
+
+    try {
+        const res = await requestUpbit('POST', '/v1/orders', { body });
+        return res.data;
+    } catch (error) {
+        console.error('❌ 지정가 매도 주문 에러:', error.response?.data || error.message);
+        throw error;
+    }
+}
+
 async function getAccounts() {
     try {
         const res = await requestUpbit('GET', '/v1/accounts');
@@ -109,4 +128,73 @@ async function getMarketVolume(market) {
     return Number(target.balance || 0);
 }
 
-module.exports = { buyMarket, sellMarket, getAccounts, getMarketVolume };
+async function getLiveAccountSummary() {
+    const accounts = await getAccounts();
+
+    const krwAccount = accounts.find((a) => a.currency === 'KRW');
+    const krwAvailable = Number(krwAccount?.balance || 0);
+    const krwLocked = Number(krwAccount?.locked || 0);
+    const krwTotal = krwAvailable + krwLocked;
+
+    const holdings = accounts
+        .map((a) => {
+            const qty = Number(a.balance || 0) + Number(a.locked || 0);
+            return {
+                currency: a.currency,
+                unitCurrency: a.unit_currency,
+                qty,
+                avgBuyPrice: Number(a.avg_buy_price || 0)
+            };
+        })
+        .filter((h) => h.currency !== 'KRW' && h.unitCurrency === 'KRW' && h.qty > 0);
+
+    const markets = holdings.map((h) => `KRW-${h.currency}`);
+    const priceByMarket = new Map();
+
+    if (markets.length > 0) {
+        try {
+            const tickerRes = await axios.get(`https://api.upbit.com/v1/ticker?markets=${markets.join(',')}`);
+            for (const t of tickerRes.data || []) {
+                priceByMarket.set(t.market, Number(t.trade_price || 0));
+            }
+        } catch (error) {
+            console.error('⚠️ 평가가격 조회 실패(일부):', error.response?.data || error.message);
+        }
+    }
+
+    let coinEvalTotal = 0;
+    let coinCostTotal = 0;
+
+    for (const h of holdings) {
+        const market = `KRW-${h.currency}`;
+        const currentPrice = priceByMarket.get(market) || h.avgBuyPrice;
+        const evalValue = h.qty * currentPrice;
+        const costValue = h.qty * h.avgBuyPrice;
+        coinEvalTotal += evalValue;
+        coinCostTotal += costValue;
+    }
+
+    const unrealizedPnl = coinEvalTotal - coinCostTotal;
+
+    return {
+        krwAvailable,
+        krwLocked,
+        krwTotal,
+        coinEvalTotal,
+        coinCostTotal,
+        totalInvested: coinCostTotal,
+        totalEarned: unrealizedPnl > 0 ? unrealizedPnl : 0,
+        totalLost: unrealizedPnl < 0 ? Math.abs(unrealizedPnl) : 0,
+        unrealizedPnl,
+        totalAssetValue: krwTotal + coinEvalTotal
+    };
+}
+
+module.exports = {
+    buyMarket,
+    sellMarket,
+    sellLimit,
+    getAccounts,
+    getMarketVolume,
+    getLiveAccountSummary
+};

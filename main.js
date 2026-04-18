@@ -3,7 +3,7 @@ require('dotenv').config();
 const axios = require('axios');
 const cron = require('node-cron');
 const { getCryptoNews, getChartData, getTechnicalSignal, getAIDecision } = require('./logic');
-const { buyMarket, sellMarket, getMarketVolume } = require('./order');
+const { buyMarket, sellMarket, sellLimit, getMarketVolume, getLiveAccountSummary } = require('./order');
 const {
     saveTrade,
     saveAILog,
@@ -25,10 +25,25 @@ const MIN_ORDER_KRW = Number(process.env.MIN_ORDER_KRW || 5000);
 const MAX_ORDER_KRW = Number(process.env.MAX_ORDER_KRW || 20000);
 const MIN_STOP_PCT = Number(process.env.MIN_STOP_PCT || 1.0);
 const CONFIRM_REAL_TRADING = process.env.CONFIRM_REAL_TRADING === 'true';
-const BOT_CRON = process.env.BOT_CRON || '*/30 * * * *';
+const BOT_CRON = process.env.BOT_CRON || '0 * * * *';
+const PRICE_MONITOR_CRON = process.env.PRICE_MONITOR_CRON || '*/1 * * * *';
 const RUN_ONCE = process.env.RUN_ONCE === 'true';
 const TAKE_PROFIT_PCT = Number(process.env.TAKE_PROFIT_PCT || 1.8);
 const TAKE_PROFIT_SELL_RATIO = Number(process.env.TAKE_PROFIT_SELL_RATIO || 0.3);
+const AGGRESSIVE_TEST_MODE = process.env.AGGRESSIVE_TEST_MODE !== 'false';
+const ENTRY_SCORE_THRESHOLD = Number(process.env.ENTRY_SCORE_THRESHOLD || 55);
+const EXIT_SCORE_THRESHOLD = Number(process.env.EXIT_SCORE_THRESHOLD || 45);
+const TECH_MIN_CONFIDENCE = Number(process.env.TECH_MIN_CONFIDENCE || 35);
+const TARGET_MARKETS = (process.env.TARGET_MARKETS || 'KRW-BTC,KRW-ETH,KRW-XRP')
+    .split(',')
+    .map((m) => m.trim())
+    .filter(Boolean);
+const MARKET_LOOP_DELAY_MS = Number(process.env.MARKET_LOOP_DELAY_MS || 500);
+const AUTO_STOP_MINUTES = Number(process.env.AUTO_STOP_MINUTES || 0);
+
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function clamp(value, min, max) {
     return Math.min(max, Math.max(min, value));
@@ -59,27 +74,79 @@ function computeTrailingDistance(currentPrice, atr) {
     return Math.max(atr * TRAILING_ATR_MULTIPLIER, fallback);
 }
 
-function combineDecision(aiResult, technicalSignal) {
-    const agreeBuy = aiResult.decision === 'BUY' && technicalSignal.decision === 'BUY';
-    const agreeSell = aiResult.decision === 'SELL' && technicalSignal.decision === 'SELL';
+function normalizeKrwPriceUnit(price) {
+    if (price >= 2000000) return Math.round(price / 1000) * 1000;
+    if (price >= 1000000) return Math.round(price / 500) * 500;
+    if (price >= 500000) return Math.round(price / 100) * 100;
+    if (price >= 100000) return Math.round(price / 50) * 50;
+    if (price >= 10000) return Math.round(price / 10) * 10;
+    if (price >= 1000) return Math.round(price);
+    if (price >= 100) return Math.round(price * 10) / 10;
+    if (price >= 10) return Math.round(price * 100) / 100;
+    if (price >= 1) return Math.round(price * 1000) / 1000;
+    return Math.round(price * 10000) / 10000;
+}
 
-    if (agreeBuy && aiResult.percentage >= BUY_CONFIDENCE_THRESHOLD && technicalSignal.confidence >= 55) {
+function computeTakeProfitLimitPrice(currentPrice, takeProfitPrice) {
+    // 목표가 이상을 유지하되, 과도한 고가 지정으로 미체결될 가능성을 줄인다.
+    const conservative = Math.max(takeProfitPrice, currentPrice * 0.999);
+    return normalizeKrwPriceUnit(conservative);
+}
+
+function combineDecision(aiResult, technicalSignal) {
+    const aiScore = aiResult.decision === 'BUY'
+        ? aiResult.percentage
+        : aiResult.decision === 'SELL'
+            ? -aiResult.percentage
+            : 0;
+
+    const techScore = technicalSignal.decision === 'BUY'
+        ? technicalSignal.confidence
+        : technicalSignal.decision === 'SELL'
+            ? -technicalSignal.confidence
+            : 0;
+
+    // 공격형 테스트 모드에서는 기술신호 가중치를 높여 진입 기회를 늘린다.
+    const wAi = AGGRESSIVE_TEST_MODE ? 0.4 : 0.55;
+    const wTech = AGGRESSIVE_TEST_MODE ? 0.6 : 0.45;
+    const combinedScore = aiScore * wAi + techScore * wTech;
+
+    const aiNotBearish = aiResult.decision !== 'SELL';
+    const aiNotBullish = aiResult.decision !== 'BUY';
+
+    if (
+        combinedScore >= ENTRY_SCORE_THRESHOLD
+        || (
+            technicalSignal.decision === 'BUY'
+            && technicalSignal.confidence >= TECH_MIN_CONFIDENCE
+            && aiNotBearish
+            && aiResult.percentage >= BUY_CONFIDENCE_THRESHOLD
+        )
+    ) {
         return {
             finalDecision: 'BUY',
-            reason: 'AI 신호와 기술 신호가 동시에 매수 방향으로 정렬되었습니다.'
+            reason: `가중 합산 점수 ${combinedScore.toFixed(1)}로 매수 진입 조건 충족`
         };
     }
 
-    if (agreeSell && aiResult.percentage >= SELL_CONFIDENCE_THRESHOLD && technicalSignal.confidence >= 55) {
+    if (
+        combinedScore <= -EXIT_SCORE_THRESHOLD
+        || (
+            technicalSignal.decision === 'SELL'
+            && technicalSignal.confidence >= TECH_MIN_CONFIDENCE
+            && aiNotBullish
+            && aiResult.percentage >= SELL_CONFIDENCE_THRESHOLD
+        )
+    ) {
         return {
             finalDecision: 'SELL',
-            reason: 'AI 신호와 기술 신호가 동시에 매도 방향으로 정렬되었습니다.'
+            reason: `가중 합산 점수 ${combinedScore.toFixed(1)}로 매도 조건 충족`
         };
     }
 
     return {
         finalDecision: 'HOLD',
-        reason: '신호 불일치 또는 확신도 부족으로 관망합니다.'
+        reason: `가중 합산 점수 ${combinedScore.toFixed(1)}가 관망 구간입니다.`
     };
 }
 
@@ -92,156 +159,171 @@ async function runBot() {
     }
 
     try {
-        // 1. 현재가 조회
-        const priceRes = await axios.get('https://api.upbit.com/v1/ticker?markets=KRW-BTC');
-        const currentPrice = priceRes.data[0].trade_price;
-        console.log(`📊 현재 비트코인 가격: ${currentPrice.toLocaleString()}원`);
+        const tickersRes = await axios.get(`https://api.upbit.com/v1/ticker?markets=${TARGET_MARKETS.join(',')}`);
+        const tickerByMarket = new Map(tickersRes.data.map((t) => [t.market, t]));
 
-        // 2. 뉴스/차트 수집 및 AI 판단
-        console.log("🔍 최신 뉴스 수집 중...");
-        const news = await getCryptoNews();
+        // 무료 Tavily 한도를 고려해 뉴스는 1회 수집 후 모든 마켓에 공통 반영한다.
+        console.log('🔍 최신 뉴스 수집 중... (공통 1회)');
+        const sharedNews = await getCryptoNews('KRW-BTC');
 
-        console.log("📈 차트 데이터 수집 중...");
-        const chartData = await getChartData();
-        const technicalSignal = getTechnicalSignal(chartData);
-
-        console.log("🧠 Gemini AI 분석 중...");
-        const aiResult = await getAIDecision(currentPrice, news, chartData, technicalSignal);
-
-        const combined = combineDecision(aiResult, technicalSignal);
-        const openPosition = await getOpenPosition('KRW-BTC', DRY_RUN);
-
-        console.log(`\n--- AI 분석: ${aiResult.decision} (${aiResult.percentage}%) ---`);
-        console.log(`이유: ${aiResult.reason}\n`);
-        console.log(`--- 기술 신호: ${technicalSignal.decision} (${technicalSignal.confidence}%) ---`);
-        console.log(`요약: ${technicalSignal.reason}`);
-        console.log(`--- 최종 의사결정: ${combined.finalDecision} ---`);
-        console.log(`근거: ${combined.reason}\n`);
-
-        if (openPosition) {
-            const positionQty = Number(openPosition.quantity_btc);
-            const positionInvested = Number(openPosition.invested_krw);
-            const entryPrice = Number(openPosition.entry_price);
-            const takeProfitDone = Boolean(openPosition.take_profit_done);
-            const prevHighest = Number(openPosition.highest_price);
-            const prevStop = Number(openPosition.trailing_stop_price);
-            const nextHighest = Math.max(prevHighest, currentPrice);
-            const trailDistance = computeTrailingDistance(currentPrice, technicalSignal.atr || Number(openPosition.atr_at_entry));
-            const recalculatedStop = nextHighest - trailDistance;
-            const nextStop = Math.max(prevStop, recalculatedStop);
-
-            if (nextHighest !== prevHighest || Math.abs(nextStop - prevStop) > 0.1) {
-                await updateOpenPosition(openPosition.id, {
-                    highest_price: nextHighest,
-                    trailing_stop_price: nextStop
-                });
+        for (const market of TARGET_MARKETS) {
+            const ticker = tickerByMarket.get(market);
+            if (!ticker) {
+                console.log(`⚠️ 현재가 없음(${market}): 해당 마켓은 건너뜁니다.`);
+                await sleep(MARKET_LOOP_DELAY_MS);
+                continue;
             }
 
-            console.log(`📌 보유 포지션 추적: 최고가=${Math.round(nextHighest).toLocaleString()} / 스탑=${Math.round(nextStop).toLocaleString()}`);
+            const currentPrice = ticker.trade_price;
+            console.log(`\n================ ${market} ================`);
+            console.log(`📊 현재 가격: ${currentPrice.toLocaleString()}원`);
 
-            const stopTriggered = currentPrice <= nextStop;
-            const aiExitTriggered = combined.finalDecision === 'SELL';
+            const news = sharedNews;
 
-            if (stopTriggered || aiExitTriggered) {
-                const exitReason = stopTriggered
-                    ? `트레일링 스탑 발동: 현재가(${Math.round(currentPrice)}) <= 스탑(${Math.round(nextStop)})`
-                    : `AI/기술 결합 매도 신호: ${combined.reason}`;
+            console.log(`📈 차트 데이터 수집 중... (${market})`);
+            const chartData = await getChartData(market);
+            const technicalSignal = getTechnicalSignal(chartData);
 
-                console.log(`📉 [청산] ${exitReason}`);
+            console.log(`🧠 Gemini AI 분석 중... (${market})`);
+            const aiResult = await getAIDecision(currentPrice, news, chartData, technicalSignal, market);
 
-                if (!DRY_RUN) {
-                    const volume = await getMarketVolume('KRW-BTC');
-                    if (volume <= 0) {
-                        console.log('⚠️ 실제 보유 수량이 없어 매도 주문을 생략합니다.');
-                        return;
-                    }
+            const combined = combineDecision(aiResult, technicalSignal);
+            const openPosition = await getOpenPosition(market, DRY_RUN);
 
-                    const sellRes = await sellMarket('KRW-BTC', volume);
-                    console.log('✅ 매도 주문 완료:', sellRes.uuid || '(uuid 없음)');
-                } else {
-                    console.log('🧪 DRY_RUN 모드: 실제 매도 주문은 생략했습니다.');
+            console.log(`--- AI 분석: ${aiResult.decision} (${aiResult.percentage}%) ---`);
+            console.log(`이유: ${aiResult.reason}`);
+            console.log(`--- 기술 신호: ${technicalSignal.decision} (${technicalSignal.confidence}%) ---`);
+            console.log(`요약: ${technicalSignal.reason}`);
+            console.log(`--- 최종 의사결정: ${combined.finalDecision} ---`);
+            console.log(`근거: ${combined.reason}`);
+
+            if (openPosition) {
+                const positionQty = Number(openPosition.quantity_btc);
+                const positionInvested = Number(openPosition.invested_krw);
+                const entryPrice = Number(openPosition.entry_price);
+                const takeProfitDone = Boolean(openPosition.take_profit_done);
+                const prevHighest = Number(openPosition.highest_price);
+                const prevStop = Number(openPosition.trailing_stop_price);
+                const nextHighest = Math.max(prevHighest, currentPrice);
+                const trailDistance = computeTrailingDistance(currentPrice, technicalSignal.atr || Number(openPosition.atr_at_entry));
+                const recalculatedStop = nextHighest - trailDistance;
+                const nextStop = Math.max(prevStop, recalculatedStop);
+
+                if (nextHighest !== prevHighest || Math.abs(nextStop - prevStop) > 0.1) {
+                    await updateOpenPosition(openPosition.id, {
+                        highest_price: nextHighest,
+                        trailing_stop_price: nextStop
+                    });
                 }
 
-                await saveTrade({
-                    side: 'sell',
-                    price: currentPrice,
-                    amount: positionInvested,
-                    reason: exitReason,
-                    is_simulated: DRY_RUN
-                });
+                console.log(`📌 보유 포지션 추적: 최고가=${Math.round(nextHighest).toLocaleString()} / 스탑=${Math.round(nextStop).toLocaleString()}`);
 
-                await closePosition(openPosition.id, currentPrice, exitReason);
-                console.log('✅ 포지션 종료 및 DB 기록 완료');
-                return;
-            }
+                const stopTriggered = currentPrice <= nextStop;
+                const aiExitTriggered = combined.finalDecision === 'SELL';
 
-            const takeProfitPrice = entryPrice * (1 + (TAKE_PROFIT_PCT / 100));
-            const takeProfitTriggered = !takeProfitDone && currentPrice >= takeProfitPrice;
+                if (stopTriggered || aiExitTriggered) {
+                    const exitReason = stopTriggered
+                        ? `트레일링 스탑 발동: 현재가(${Math.round(currentPrice)}) <= 스탑(${Math.round(nextStop)})`
+                        : `AI/기술 결합 매도 신호: ${combined.reason}`;
 
-            if (takeProfitTriggered) {
-                const partialRatio = clamp(TAKE_PROFIT_SELL_RATIO, 0.1, 0.9);
-                const partialQty = positionQty * partialRatio;
-                const remainQty = positionQty - partialQty;
-                const partialInvested = positionInvested * partialRatio;
-                const remainInvested = positionInvested - partialInvested;
+                    console.log(`📉 [청산:${market}] ${exitReason}`);
 
-                console.log(`💸 [부분익절] 목표가 도달: ${Math.round(takeProfitPrice).toLocaleString()}원 (${TAKE_PROFIT_PCT}%)`);
+                    if (!DRY_RUN) {
+                        const volume = await getMarketVolume(market);
+                        if (volume <= 0) {
+                            console.log(`⚠️ 실제 보유 수량이 없어 매도 주문을 생략합니다. (${market})`);
+                            await sleep(MARKET_LOOP_DELAY_MS);
+                            continue;
+                        }
 
-                if (!DRY_RUN) {
-                    const volume = await getMarketVolume('KRW-BTC');
-                    const sellQty = Math.min(volume, partialQty);
-                    if (sellQty > 0) {
-                        const sellRes = await sellMarket('KRW-BTC', sellQty.toFixed(8));
-                        console.log('✅ 부분익절 주문 완료:', sellRes.uuid || '(uuid 없음)');
+                        const sellRes = await sellMarket(market, volume);
+                        console.log('✅ 매도 주문 완료:', sellRes.uuid || '(uuid 없음)');
                     } else {
-                        console.log('⚠️ 부분익절 가능한 보유 수량이 없어 주문을 생략합니다.');
+                        console.log('🧪 DRY_RUN 모드: 실제 매도 주문은 생략했습니다.');
                     }
-                } else {
-                    console.log('🧪 DRY_RUN 모드: 부분익절 주문은 생략했습니다.');
+
+                    await saveTrade({
+                        side: 'sell',
+                        price: currentPrice,
+                        amount: positionInvested,
+                        reason: `[${market}] ${exitReason}`,
+                        is_simulated: DRY_RUN
+                    });
+
+                    await closePosition(openPosition.id, currentPrice, exitReason);
+                    console.log(`✅ 포지션 종료 및 DB 기록 완료 (${market})`);
+                    await sleep(MARKET_LOOP_DELAY_MS);
+                    continue;
                 }
 
-                await saveTrade({
-                    side: 'sell',
-                    price: currentPrice,
-                    amount: partialInvested,
-                    reason: `부분익절 ${Math.round(partialRatio * 100)}% 실행`,
-                    is_simulated: DRY_RUN
-                });
+                const takeProfitPrice = entryPrice * (1 + (TAKE_PROFIT_PCT / 100));
+                const takeProfitTriggered = !takeProfitDone && currentPrice >= takeProfitPrice;
 
-                await updateOpenPosition(openPosition.id, {
-                    quantity_btc: remainQty,
-                    invested_krw: remainInvested,
-                    take_profit_done: true,
-                    highest_price: nextHighest,
-                    trailing_stop_price: nextStop
-                });
+                if (takeProfitTriggered) {
+                    const partialRatio = clamp(TAKE_PROFIT_SELL_RATIO, 0.1, 0.9);
+                    const partialQty = positionQty * partialRatio;
+                    const remainQty = positionQty - partialQty;
+                    const partialInvested = positionInvested * partialRatio;
+                    const remainInvested = positionInvested - partialInvested;
+                    const limitPrice = computeTakeProfitLimitPrice(currentPrice, takeProfitPrice);
 
-                console.log(`✅ 부분익절 완료: 잔여 수량=${remainQty.toFixed(8)} BTC`);
-                return;
+                    console.log(`💸 [부분익절:${market}] 목표가 도달: ${Math.round(takeProfitPrice).toLocaleString()}원 (${TAKE_PROFIT_PCT}%)`);
+
+                    if (!DRY_RUN) {
+                        const volume = await getMarketVolume(market);
+                        const sellQty = Math.min(volume, partialQty);
+                        if (sellQty > 0) {
+                            const sellRes = await sellLimit(market, sellQty.toFixed(8), limitPrice);
+                            console.log(`✅ 부분익절 지정가 주문 완료: ${limitPrice.toLocaleString()}원`, sellRes.uuid || '(uuid 없음)');
+                        } else {
+                            console.log('⚠️ 부분익절 가능한 보유 수량이 없어 주문을 생략합니다.');
+                        }
+                    } else {
+                        console.log('🧪 DRY_RUN 모드: 부분익절 주문은 생략했습니다.');
+                    }
+
+                    await saveTrade({
+                        side: 'sell',
+                        price: currentPrice,
+                        amount: partialInvested,
+                        reason: `[${market}] 부분익절 ${Math.round(partialRatio * 100)}% 실행(지정가 ${limitPrice})`,
+                        is_simulated: DRY_RUN
+                    });
+
+                    await updateOpenPosition(openPosition.id, {
+                        quantity_btc: remainQty,
+                        invested_krw: remainInvested,
+                        take_profit_done: true,
+                        highest_price: nextHighest,
+                        trailing_stop_price: nextStop
+                    });
+
+                    console.log(`✅ 부분익절 완료(${market}): 잔여 수량=${remainQty.toFixed(8)} BTC`);
+                    await sleep(MARKET_LOOP_DELAY_MS);
+                    continue;
+                }
+
+                console.log(`🛡️ 보유 포지션 유지(${market}): 청산 조건이 아직 충족되지 않았습니다.`);
+                await sleep(MARKET_LOOP_DELAY_MS);
+                continue;
             }
 
-            console.log('🛡️ 보유 포지션 유지: 청산 조건이 아직 충족되지 않았습니다.');
-            return;
-        }
+            await saveAILog({
+                decision: combined.finalDecision,
+                sentiment_score: aiResult.percentage,
+                analysis_reason: `[${market}] ${aiResult.reason} | TECH: ${technicalSignal.reason} | FINAL: ${combined.reason}`,
+                is_simulated: DRY_RUN
+            });
 
-        // 3. AI 로그 저장
-        await saveAILog({
-            decision: combined.finalDecision,
-            sentiment_score: aiResult.percentage,
-            analysis_reason: `${aiResult.reason} | TECH: ${technicalSignal.reason} | FINAL: ${combined.reason}`,
-            is_simulated: DRY_RUN
-        });
-
-        // 4. 신규 진입 로직
-        if (combined.finalDecision === 'BUY') {
+            if (combined.finalDecision === 'BUY') {
             const orderKrw = computeOrderSizeKrw(currentPrice, technicalSignal);
             const qty = orderKrw / currentPrice;
             const initialStop = currentPrice - computeTrailingDistance(currentPrice, technicalSignal.atr);
 
-            console.log(`💰 [실행] 신규 진입: ${orderKrw.toLocaleString()}원 (변동성 기반) 매수 시도.`);
+            console.log(`💰 [실행:${market}] 신규 진입: ${orderKrw.toLocaleString()}원 (변동성 기반) 매수 시도.`);
 
             if (!DRY_RUN) {
-                const orderRes = await buyMarket('KRW-BTC', orderKrw);
+                const orderRes = await buyMarket(market, orderKrw);
                 console.log('✅ 매수 주문 완료:', orderRes.uuid || '(uuid 없음)');
             } else {
                 console.log('🧪 DRY_RUN 모드: 실제 주문은 생략했습니다.');
@@ -251,27 +333,45 @@ async function runBot() {
                 side: 'buy',
                 price: currentPrice,
                 amount: orderKrw,
-                reason: `${aiResult.reason} | ${technicalSignal.reason} | stop=${Math.round(initialStop)}`,
+                reason: `[${market}] ${aiResult.reason} | ${technicalSignal.reason} | stop=${Math.round(initialStop)}`,
                 is_simulated: DRY_RUN
             });
 
             await createOpenPosition({
-                market: 'KRW-BTC',
+                market,
                 entry_price: currentPrice,
                 quantity_btc: qty,
                 invested_krw: orderKrw,
                 highest_price: currentPrice,
                 trailing_stop_price: initialStop,
                 atr_at_entry: technicalSignal.atr,
-                entry_reason: `${aiResult.reason} | ${technicalSignal.reason}`,
+                entry_reason: `[${market}] ${aiResult.reason} | ${technicalSignal.reason}`,
                 is_simulated: DRY_RUN,
                 take_profit_done: false
             });
 
-            console.log('✅ 매수 기록 DB 저장 완료');
+            console.log(`✅ 매수 기록 DB 저장 완료 (${market})`);
+            }
+            else {
+                console.log(`😴 [대기:${market}] 매매 조건이 충족되지 않았습니다.`);
+            }
+
+            await sleep(MARKET_LOOP_DELAY_MS);
         }
-        else {
-            console.log('😴 [대기] 매매 조건이 충족되지 않았습니다.');
+
+        if (!DRY_RUN) {
+            const live = await getLiveAccountSummary();
+            console.log('\n💼 ====== 1시간 실계좌 요약 ======');
+            console.log(`총 투자금액(보유코인 매수원금): ${Math.round(live.totalInvested).toLocaleString()}원`);
+            console.log(`번 돈(평가손익+): ${Math.round(live.totalEarned).toLocaleString()}원`);
+            console.log(`잃은 돈(평가손익-): ${Math.round(live.totalLost).toLocaleString()}원`);
+            console.log(`원화 잔고(가용+주문중): ${Math.round(live.krwTotal).toLocaleString()}원`);
+            console.log(`코인 평가금액: ${Math.round(live.coinEvalTotal).toLocaleString()}원`);
+            console.log(`총 자산 평가금액: ${Math.round(live.totalAssetValue).toLocaleString()}원`);
+            console.log(`미실현 손익: ${Math.round(live.unrealizedPnl).toLocaleString()}원`);
+            console.log('================================\n');
+        } else {
+            console.log('\n💼 DRY_RUN 모드에서는 실계좌 요약을 생략합니다.\n');
         }
     } catch (err) {
         console.error('❌ 봇 실행 중 치명적 오류:', err.response?.data || err.message);
@@ -279,6 +379,7 @@ async function runBot() {
 }
 
 let isRunning = false;
+let isMonitorRunning = false;
 
 async function runBotSafely() {
     if (isRunning) {
@@ -294,14 +395,160 @@ async function runBotSafely() {
     }
 }
 
+async function runPriceMonitor() {
+    try {
+        const tickersRes = await axios.get(`https://api.upbit.com/v1/ticker?markets=${TARGET_MARKETS.join(',')}`);
+        const tickerByMarket = new Map(tickersRes.data.map((t) => [t.market, t]));
+
+        for (const market of TARGET_MARKETS) {
+            const openPosition = await getOpenPosition(market, DRY_RUN);
+            if (!openPosition) {
+                await sleep(MARKET_LOOP_DELAY_MS);
+                continue;
+            }
+
+            const ticker = tickerByMarket.get(market);
+            if (!ticker) {
+                console.log(`⚠️ 모니터링 현재가 없음(${market})`);
+                await sleep(MARKET_LOOP_DELAY_MS);
+                continue;
+            }
+
+            const currentPrice = Number(ticker.trade_price);
+            const positionQty = Number(openPosition.quantity_btc);
+            const positionInvested = Number(openPosition.invested_krw);
+            const entryPrice = Number(openPosition.entry_price);
+            const takeProfitDone = Boolean(openPosition.take_profit_done);
+            const prevHighest = Number(openPosition.highest_price);
+            const prevStop = Number(openPosition.trailing_stop_price);
+            const nextHighest = Math.max(prevHighest, currentPrice);
+            const trailDistance = computeTrailingDistance(currentPrice, Number(openPosition.atr_at_entry));
+            const recalculatedStop = nextHighest - trailDistance;
+            const nextStop = Math.max(prevStop, recalculatedStop);
+
+            if (nextHighest !== prevHighest || Math.abs(nextStop - prevStop) > 0.1) {
+                await updateOpenPosition(openPosition.id, {
+                    highest_price: nextHighest,
+                    trailing_stop_price: nextStop
+                });
+            }
+
+            const stopTriggered = currentPrice <= nextStop;
+
+            if (stopTriggered) {
+                const exitReason = `모니터링 트레일링 스탑 발동: 현재가(${Math.round(currentPrice)}) <= 스탑(${Math.round(nextStop)})`;
+                console.log(`📉 [모니터링 청산:${market}] ${exitReason}`);
+
+                if (!DRY_RUN) {
+                    const volume = await getMarketVolume(market);
+                    if (volume > 0) {
+                        const sellRes = await sellMarket(market, volume);
+                        console.log('✅ 모니터링 매도 주문 완료:', sellRes.uuid || '(uuid 없음)');
+                    } else {
+                        console.log(`⚠️ 실제 보유 수량이 없어 모니터링 매도를 생략합니다. (${market})`);
+                    }
+                } else {
+                    console.log('🧪 DRY_RUN 모드: 모니터링 매도 주문은 생략했습니다.');
+                }
+
+                await saveTrade({
+                    side: 'sell',
+                    price: currentPrice,
+                    amount: positionInvested,
+                    reason: `[${market}] ${exitReason}`,
+                    is_simulated: DRY_RUN
+                });
+
+                await closePosition(openPosition.id, currentPrice, exitReason);
+                await sleep(MARKET_LOOP_DELAY_MS);
+                continue;
+            }
+
+            const takeProfitPrice = entryPrice * (1 + (TAKE_PROFIT_PCT / 100));
+            const takeProfitTriggered = !takeProfitDone && currentPrice >= takeProfitPrice;
+
+            if (takeProfitTriggered) {
+                const partialRatio = clamp(TAKE_PROFIT_SELL_RATIO, 0.1, 0.9);
+                const partialQty = positionQty * partialRatio;
+                const remainQty = positionQty - partialQty;
+                const partialInvested = positionInvested * partialRatio;
+                const remainInvested = positionInvested - partialInvested;
+                const limitPrice = computeTakeProfitLimitPrice(currentPrice, takeProfitPrice);
+
+                console.log(`💸 [모니터링 부분익절:${market}] 목표가 도달: ${Math.round(takeProfitPrice).toLocaleString()}원 (${TAKE_PROFIT_PCT}%)`);
+
+                if (!DRY_RUN) {
+                    const volume = await getMarketVolume(market);
+                    const sellQty = Math.min(volume, partialQty);
+                    if (sellQty > 0) {
+                        const sellRes = await sellLimit(market, sellQty.toFixed(8), limitPrice);
+                        console.log(`✅ 모니터링 부분익절 지정가 주문 완료: ${limitPrice.toLocaleString()}원`, sellRes.uuid || '(uuid 없음)');
+                    } else {
+                        console.log('⚠️ 부분익절 가능한 보유 수량이 없어 주문을 생략합니다.');
+                    }
+                } else {
+                    console.log('🧪 DRY_RUN 모드: 부분익절 주문은 생략했습니다.');
+                }
+
+                await saveTrade({
+                    side: 'sell',
+                    price: currentPrice,
+                    amount: partialInvested,
+                    reason: `[${market}] 모니터링 부분익절 ${Math.round(partialRatio * 100)}% 실행(지정가 ${limitPrice})`,
+                    is_simulated: DRY_RUN
+                });
+
+                await updateOpenPosition(openPosition.id, {
+                    quantity_btc: remainQty,
+                    invested_krw: remainInvested,
+                    take_profit_done: true,
+                    highest_price: nextHighest,
+                    trailing_stop_price: nextStop
+                });
+            }
+
+            await sleep(MARKET_LOOP_DELAY_MS);
+        }
+    } catch (err) {
+        console.error('❌ 가격 모니터링 중 오류:', err.response?.data || err.message);
+    }
+}
+
+async function runPriceMonitorSafely() {
+    if (isMonitorRunning) {
+        console.log('⏭️ 이전 가격 모니터링이 아직 진행 중이라 이번 스케줄은 건너뜁니다.');
+        return;
+    }
+
+    isMonitorRunning = true;
+    try {
+        await runPriceMonitor();
+    } finally {
+        isMonitorRunning = false;
+    }
+}
+
 if (RUN_ONCE) {
     runBotSafely();
 } else {
     cron.schedule(BOT_CRON, async () => {
-        console.log(`⏰ 스케줄 실행: ${new Date().toLocaleString()}`);
+        console.log(`⏰ 정각 스케줄 실행(${BOT_CRON}): ${new Date().toLocaleString()}`);
         await runBotSafely();
     });
 
-    console.log(`🤖 봇 대기 중... 스케줄러 작동 시작 (BOT_CRON=${BOT_CRON})`);
+    cron.schedule(PRICE_MONITOR_CRON, async () => {
+        await runPriceMonitorSafely();
+    });
+
+    console.log(`🤖 봇 대기 중... 스케줄러 작동 시작 (BOT_CRON=${BOT_CRON}, PRICE_MONITOR_CRON=${PRICE_MONITOR_CRON})`);
     runBotSafely();
+    runPriceMonitorSafely();
+
+    if (AUTO_STOP_MINUTES > 0) {
+        console.log(`⏳ 자동 종료 예약: ${AUTO_STOP_MINUTES}분 후 프로세스를 종료합니다.`);
+        setTimeout(() => {
+            console.log('🛑 테스트 시간이 종료되어 봇을 종료합니다.');
+            process.exit(0);
+        }, AUTO_STOP_MINUTES * 60 * 1000);
+    }
 }

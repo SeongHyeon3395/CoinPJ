@@ -1,6 +1,15 @@
 require('dotenv').config();
 const axios = require('axios');
 
+function getAssetContext(market) {
+    const mapping = {
+        'KRW-BTC': { symbol: 'BTC', english: 'bitcoin', korean: '비트코인' },
+        'KRW-ETH': { symbol: 'ETH', english: 'ethereum', korean: '이더리움' },
+        'KRW-XRP': { symbol: 'XRP', english: 'ripple', korean: '리플' }
+    };
+    return mapping[market] || { symbol: market.replace('KRW-', ''), english: 'crypto', korean: market };
+}
+
 function clamp(value, min, max) {
     return Math.min(max, Math.max(min, value));
 }
@@ -63,11 +72,12 @@ function calculateATR(chartData, period = 14) {
 }
 
 // 1. Tavily를 이용한 실시간 뉴스 수집
-async function getCryptoNews() {
+async function getCryptoNews(market = 'KRW-BTC') {
     try {
+        const asset = getAssetContext(market);
         const response = await axios.post('https://api.tavily.com/search', {
             api_key: process.env.TAVILY_API_KEY,
-            query: "current bitcoin price movement news and crypto market sentiment",
+            query: `latest ${asset.english} (${asset.symbol}) price movement news and crypto market sentiment`,
             search_depth: "advanced",
             max_results: 5
         });
@@ -77,19 +87,19 @@ async function getCryptoNews() {
     } catch (error) {
         const status = error.response?.status;
         const detail = error.response?.data || error.message;
-        console.error("❌ 뉴스 수집 실패:", status, detail);
+        console.error(`❌ 뉴스 수집 실패(${market}):`, status, detail);
         return "뉴스를 가져오지 못했습니다.";
     }
 }
 
 // 2. 업비트 OHLCV(1시간봉) 수집
-async function getChartData() {
+async function getChartData(market = 'KRW-BTC') {
     try {
         const candleUnit = Number(process.env.CHART_CANDLE_UNIT_MINUTES || 60);
         const count = Number(process.env.CHART_CANDLE_COUNT || 48);
 
         const response = await axios.get(`https://api.upbit.com/v1/candles/minutes/${candleUnit}`, {
-            params: { market: 'KRW-BTC', count }
+            params: { market, count }
         });
 
         // 업비트 캔들은 최신순이라 과거 -> 현재 순으로 뒤집어 둔다.
@@ -104,7 +114,7 @@ async function getChartData() {
     } catch (error) {
         const status = error.response?.status;
         const detail = error.response?.data || error.message;
-        console.error('❌ 차트 데이터 수집 실패:', status, detail);
+        console.error(`❌ 차트 데이터 수집 실패(${market}):`, status, detail);
         return [];
     }
 }
@@ -180,18 +190,26 @@ function getTechnicalSignal(chartData) {
 }
 
 // 4. 뉴스 + 차트 + 기술지표를 함께 Gemini에 전달
-async function getAIDecision(currentPrice, news, chartData, technicalSignal) {
-    const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+async function requestGeminiSingleModel(payload) {
+    const model = process.env.GEMINI_MODEL || 'gemini-3.1-flash-lite-preview';
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`;
+    const response = await axios.post(url, payload, { timeout: 25000 });
+    console.log(`✅ Gemini 모델 사용(단일): ${model}`);
+    return response;
+}
+
+async function getAIDecision(currentPrice, news, chartData, technicalSignal, market = 'KRW-BTC') {
+    const asset = getAssetContext(market);
 
     const chartString = (chartData || []).slice(-12).map((d) => (
         `${d.time}: O=${d.open}, H=${d.high}, L=${d.low}, C=${d.close}, V=${d.vol.toFixed(2)}`
     )).join('\n');
     
     const prompt = `
-        당신은 리스크 관리를 최우선으로 하는 BTC 단기 트레이더입니다. 아래 데이터를 종합해 판단하세요.
+        당신은 리스크 관리를 최우선으로 하는 ${asset.korean}(${asset.symbol}) 단기 트레이더입니다. 아래 데이터를 종합해 판단하세요.
         
-        [현재 비트코인 가격]: ${currentPrice}원
+        [마켓]: ${market}
+        [현재 가격]: ${currentPrice}원
         [최신 시장 뉴스]:
         ${news}
 
@@ -215,7 +233,7 @@ async function getAIDecision(currentPrice, news, chartData, technicalSignal) {
     `;
 
     try {
-        const response = await axios.post(url, {
+        const response = await requestGeminiSingleModel({
             contents: [{ parts: [{ text: prompt }] }],
             generationConfig: {
                 temperature: 0.2,
@@ -234,7 +252,7 @@ async function getAIDecision(currentPrice, news, chartData, technicalSignal) {
     } catch (error) {
         const status = error.response?.status;
         const detail = error.response?.data || error.message;
-        console.error("❌ Gemini 분석 실패:", status, detail);
+        console.error(`❌ Gemini 분석 실패(${market}):`, status, detail);
         return { decision: "HOLD", percentage: 0, reason: "AI 분석 에러" };
     }
 }

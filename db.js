@@ -108,11 +108,65 @@ async function closePosition(positionId, exitPrice, exitReason) {
     return data;
 }
 
+async function getTradeCashflowSummary(isSimulated = false) {
+    const { data, error } = await supabase
+        .from('quant_trades')
+        .select('side,amount,is_simulated')
+        .eq('is_simulated', isSimulated);
+
+    if (error) {
+        console.error('❌ DB 조회 에러(trade_summary):', error);
+        return {
+            totalBuy: 0,
+            totalSell: 0,
+            totalInvested: 0,
+            totalEarned: 0,
+            totalLost: 0,
+            netCashflow: 0
+        };
+    }
+
+    let totalBuy = 0;
+    let totalSell = 0;
+    for (const row of data || []) {
+        const amount = Number(row.amount || 0);
+        if (row.side === 'buy') totalBuy += amount;
+        if (row.side === 'sell') totalSell += amount;
+    }
+
+    const netCashflow = totalSell - totalBuy;
+    return {
+        totalBuy,
+        totalSell,
+        totalInvested: totalBuy,
+        totalEarned: netCashflow > 0 ? netCashflow : 0,
+        totalLost: netCashflow < 0 ? Math.abs(netCashflow) : 0,
+        netCashflow
+    };
+}
+
+async function getOpenPositionsTotal(isSimulated = false) {
+    const { data, error } = await supabase
+        .from('quant_positions')
+        .select('invested_krw')
+        .eq('status', 'OPEN')
+        .eq('is_simulated', isSimulated);
+
+    if (error) {
+        console.error('❌ DB 조회 에러(open_positions_total):', error);
+        return 0;
+    }
+
+    return (data || []).reduce((sum, row) => sum + Number(row.invested_krw || 0), 0);
+}
+
 module.exports = {
     saveTrade,
     saveAILog,
     getOpenPosition,
     createOpenPosition,
     updateOpenPosition,
-    closePosition
+    closePosition,
+    getTradeCashflowSummary,
+    getOpenPositionsTotal
 };
