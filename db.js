@@ -160,6 +160,32 @@ async function getOpenPositionsTotal(isSimulated = false) {
     return (data || []).reduce((sum, row) => sum + Number(row.invested_krw || 0), 0);
 }
 
+async function upsertSyncReport(reportData) {
+    const today = new Date().toISOString().slice(0, 10);
+    const payload = {
+        report_date: reportData.report_date || today,
+        is_simulated: reportData.is_simulated ?? false,
+        checked_markets: reportData.checked_markets ?? 0,
+        mismatches: reportData.mismatches ?? 0,
+        recovered_count: reportData.recovered_count ?? 0,
+        closed_count: reportData.closed_count ?? 0,
+        qty_adjusted_count: reportData.qty_adjusted_count ?? 0,
+        details: reportData.details || null
+    };
+
+    const { data, error } = await supabase
+        .from('quant_sync_reports')
+        .upsert(payload, { onConflict: 'report_date,is_simulated' })
+        .select('*')
+        .maybeSingle();
+
+    if (error) {
+        console.error('❌ DB 저장 에러(sync_reports):', error);
+        return null;
+    }
+    return data;
+}
+
 module.exports = {
     saveTrade,
     saveAILog,
@@ -168,5 +194,6 @@ module.exports = {
     updateOpenPosition,
     closePosition,
     getTradeCashflowSummary,
-    getOpenPositionsTotal
+    getOpenPositionsTotal,
+    upsertSyncReport
 };

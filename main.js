@@ -3,14 +3,25 @@ require('dotenv').config();
 const axios = require('axios');
 const cron = require('node-cron');
 const { getCryptoNews, getChartData, getTechnicalSignal, getAIDecision } = require('./logic');
-const { buyMarket, sellMarket, sellLimit, getMarketVolume, getLiveAccountSummary } = require('./order');
+const {
+    buyMarket,
+    sellMarket,
+    sellLimit,
+    getOpenOrders,
+    cancelOrder,
+    getOrder,
+    getAccounts,
+    getMarketVolume,
+    getLiveAccountSummary
+} = require('./order');
 const {
     saveTrade,
     saveAILog,
     getOpenPosition,
     createOpenPosition,
     updateOpenPosition,
-    closePosition
+    closePosition,
+    upsertSyncReport
 } = require('./db');
 
 const DRY_RUN = process.env.DRY_RUN !== 'false';
@@ -23,10 +34,13 @@ const STOP_ATR_MULTIPLIER = Number(process.env.STOP_ATR_MULTIPLIER || 2.0);
 const TRAILING_ATR_MULTIPLIER = Number(process.env.TRAILING_ATR_MULTIPLIER || 2.0);
 const MIN_ORDER_KRW = Number(process.env.MIN_ORDER_KRW || 5000);
 const MAX_ORDER_KRW = Number(process.env.MAX_ORDER_KRW || 20000);
-const MIN_STOP_PCT = Number(process.env.MIN_STOP_PCT || 1.0);
+const MIN_STOP_PCT_INPUT = Number(process.env.MIN_STOP_PCT || 2.0);
+const MIN_STOP_PCT_FLOOR = Number(process.env.MIN_STOP_PCT_FLOOR || 1.5);
+const MIN_STOP_PCT = Math.max(MIN_STOP_PCT_INPUT, MIN_STOP_PCT_FLOOR);
 const CONFIRM_REAL_TRADING = process.env.CONFIRM_REAL_TRADING === 'true';
 const BOT_CRON = process.env.BOT_CRON || '0 * * * *';
 const PRICE_MONITOR_CRON = process.env.PRICE_MONITOR_CRON || '*/1 * * * *';
+const POSITION_SYNC_CRON = process.env.POSITION_SYNC_CRON || '5 0 * * *';
 const RUN_ONCE = process.env.RUN_ONCE === 'true';
 const TAKE_PROFIT_PCT = Number(process.env.TAKE_PROFIT_PCT || 1.8);
 const TAKE_PROFIT_SELL_RATIO = Number(process.env.TAKE_PROFIT_SELL_RATIO || 0.3);
@@ -39,7 +53,17 @@ const TARGET_MARKETS = (process.env.TARGET_MARKETS || 'KRW-BTC,KRW-ETH,KRW-XRP')
     .map((m) => m.trim())
     .filter(Boolean);
 const MARKET_LOOP_DELAY_MS = Number(process.env.MARKET_LOOP_DELAY_MS || 500);
+const CANCEL_SETTLE_DELAY_MS = Number(process.env.CANCEL_SETTLE_DELAY_MS || 1000);
+const LIMIT_FILL_CHECK_DELAY_MS = Number(process.env.LIMIT_FILL_CHECK_DELAY_MS || 2500);
+const PARTIAL_TP_ORDER_TTL_MS = Number(process.env.PARTIAL_TP_ORDER_TTL_MS || 300000);
+const POSITION_SYNC_ON_START = process.env.POSITION_SYNC_ON_START !== 'false';
+const POSITION_SYNC_DUST_QTY = Number(process.env.POSITION_SYNC_DUST_QTY || 0.00001);
+const SYNC_REPORT_AS_AI_LOG = process.env.SYNC_REPORT_AS_AI_LOG !== 'false';
 const AUTO_STOP_MINUTES = Number(process.env.AUTO_STOP_MINUTES || 0);
+
+if (MIN_STOP_PCT_INPUT < MIN_STOP_PCT_FLOOR) {
+    console.log(`⚠️ MIN_STOP_PCT=${MIN_STOP_PCT_INPUT}% 가 너무 낮아 ${MIN_STOP_PCT}%로 상향 보정했습니다.`);
+}
 
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -91,6 +115,311 @@ function computeTakeProfitLimitPrice(currentPrice, takeProfitPrice) {
     // 목표가 이상을 유지하되, 과도한 고가 지정으로 미체결될 가능성을 줄인다.
     const conservative = Math.max(takeProfitPrice, currentPrice * 0.999);
     return normalizeKrwPriceUnit(conservative);
+}
+
+function getBaseCurrency(market) {
+    return market.split('-')[1];
+}
+
+function parseOrderExecution(order, fallbackPrice = 0, fallbackVolume = 0) {
+    const executedVolume = Number(order?.executed_volume || fallbackVolume || 0);
+    const paidFee = Number(order?.paid_fee || 0);
+    const avgPriceCandidate = Number(order?.avg_price || 0);
+
+    const trades = Array.isArray(order?.trades) ? order.trades : [];
+    const tradesFunds = trades.reduce((sum, t) => sum + Number(t.funds || 0), 0);
+    const fundsFromField = Number(order?.executed_funds || 0);
+
+    const grossFunds = tradesFunds > 0
+        ? tradesFunds
+        : fundsFromField > 0
+            ? fundsFromField
+            : executedVolume * (avgPriceCandidate > 0 ? avgPriceCandidate : fallbackPrice);
+
+    const avgPrice = executedVolume > 0
+        ? grossFunds / executedVolume
+        : (avgPriceCandidate > 0 ? avgPriceCandidate : fallbackPrice);
+
+    const netProceeds = Math.max(0, grossFunds - paidFee);
+
+    return {
+        executedVolume,
+        avgPrice,
+        grossFunds,
+        paidFee,
+        netProceeds
+    };
+}
+
+function computeCostBasis(positionInvested, positionQty, executedVolume) {
+    if (positionQty <= 0 || executedVolume <= 0) return 0;
+    const ratio = clamp(executedVolume / positionQty, 0, 1);
+    return positionInvested * ratio;
+}
+
+function isOrderStale(order, ttlMs) {
+    const createdAt = new Date(order.created_at).getTime();
+    if (Number.isNaN(createdAt)) return false;
+    return Date.now() - createdAt >= ttlMs;
+}
+
+async function managePartialTakeProfitOrders(market) {
+    if (DRY_RUN) {
+        return { hasActiveFreshOrder: false, canceledCount: 0 };
+    }
+
+    const openAskOrders = await getOpenOrders(market, 'ask');
+    if (!openAskOrders.length) {
+        return { hasActiveFreshOrder: false, canceledCount: 0 };
+    }
+
+    const staleOrders = openAskOrders.filter((o) => isOrderStale(o, PARTIAL_TP_ORDER_TTL_MS));
+    const freshOrders = openAskOrders.filter((o) => !isOrderStale(o, PARTIAL_TP_ORDER_TTL_MS));
+
+    let canceledCount = 0;
+    if (staleOrders.length > 0) {
+        console.log(`♻️ [${market}] TTL 경과 미체결 주문 ${staleOrders.length}건을 취소하고 재호가 준비합니다.`);
+        for (const order of staleOrders) {
+            try {
+                await cancelOrder(order.uuid);
+                canceledCount += 1;
+                console.log(`✅ TTL 취소 완료: ${order.uuid}`);
+            } catch (error) {
+                console.error(`❌ TTL 취소 실패(${order.uuid}):`, error.response?.data || error.message);
+            }
+        }
+
+        if (canceledCount > 0) {
+            await sleep(CANCEL_SETTLE_DELAY_MS);
+        }
+    }
+
+    return {
+        hasActiveFreshOrder: freshOrders.length > 0,
+        canceledCount
+    };
+}
+
+async function cancelOpenAskOrders(market) {
+    if (DRY_RUN) return 0;
+
+    const openAskOrders = await getOpenOrders(market, 'ask');
+    if (!openAskOrders.length) return 0;
+
+    console.log(`⚠️ [${market}] 미체결 매도 주문 ${openAskOrders.length}건 취소를 시작합니다.`);
+
+    let canceled = 0;
+    for (const order of openAskOrders) {
+        try {
+            await cancelOrder(order.uuid);
+            canceled += 1;
+            console.log(`✅ 미체결 주문 취소 완료: ${order.uuid}`);
+        } catch (error) {
+            console.error(`❌ 주문 취소 실패(${order.uuid}):`, error.response?.data || error.message);
+        }
+    }
+
+    if (canceled > 0) {
+        await sleep(CANCEL_SETTLE_DELAY_MS);
+    }
+
+    return canceled;
+}
+
+async function executeExitFlow({ market, currentPrice, positionQty, positionInvested, positionId, exitReason }) {
+    let sold = DRY_RUN;
+    let executed = {
+        executedVolume: positionQty,
+        avgPrice: currentPrice,
+        grossFunds: positionInvested,
+        paidFee: 0,
+        netProceeds: positionInvested
+    };
+
+    if (!DRY_RUN) {
+        await cancelOpenAskOrders(market);
+
+        const volume = await getMarketVolume(market);
+        if (volume <= 0) {
+            console.log(`⚠️ 실제 보유 수량이 없어 매도 주문을 생략합니다. (${market})`);
+            return false;
+        }
+
+        try {
+            const sellRes = await sellMarket(market, volume);
+            console.log('✅ 매도 주문 완료:', sellRes.uuid || '(uuid 없음)');
+
+            await sleep(LIMIT_FILL_CHECK_DELAY_MS);
+            const orderInfo = sellRes.uuid ? await getOrder(sellRes.uuid) : null;
+            executed = parseOrderExecution(orderInfo || sellRes, currentPrice, volume);
+            sold = true;
+        } catch (error) {
+            console.error(`❌ 시장가 청산 실패(${market}):`, error.response?.data || error.message);
+            return false;
+        }
+    } else {
+        console.log('🧪 DRY_RUN 모드: 실제 매도 주문은 생략했습니다.');
+    }
+
+    if (!sold) return false;
+
+    const executedVolume = clamp(executed.executedVolume, 0, positionQty);
+    if (!DRY_RUN && executedVolume <= POSITION_SYNC_DUST_QTY) {
+        console.log(`⚠️ [${market}] 체결수량이 0에 가까워 DB 청산을 보류합니다.`);
+        return false;
+    }
+
+    const costBasis = DRY_RUN
+        ? positionInvested
+        : computeCostBasis(positionInvested, positionQty, executedVolume);
+    const realizedPnl = executed.netProceeds - costBasis;
+    const remainQty = Math.max(0, positionQty - executedVolume);
+    const remainInvested = Math.max(0, positionInvested - costBasis);
+
+    await saveTrade({
+        side: 'sell',
+        price: executed.avgPrice,
+        amount: DRY_RUN ? positionInvested : executed.netProceeds,
+        reason: `[${market}] ${exitReason} | exec_qty=${executedVolume.toFixed(8)} | fee=${Math.round(executed.paidFee)} | pnl=${Math.round(realizedPnl)}`,
+        is_simulated: DRY_RUN
+    });
+
+    if (remainQty <= POSITION_SYNC_DUST_QTY) {
+        await closePosition(positionId, executed.avgPrice, `${exitReason} | 실현손익=${Math.round(realizedPnl)}원`);
+        console.log(`✅ 포지션 종료 및 DB 기록 완료 (${market})`);
+    } else {
+        await updateOpenPosition(positionId, {
+            quantity_btc: remainQty,
+            invested_krw: remainInvested,
+            highest_price: currentPrice,
+            trailing_stop_price: Math.max(currentPrice - computeTrailingDistance(currentPrice, null), 1)
+        });
+        console.log(`⚠️ 부분 체결(${market}): 잔여 수량 ${remainQty.toFixed(8)} BTC 유지, 다음 루프에서 재청산 시도`);
+    }
+
+    return true;
+}
+
+async function hasPendingAskOrder(market) {
+    if (DRY_RUN) return false;
+    const openAskOrders = await getOpenOrders(market, 'ask');
+    return openAskOrders.length > 0;
+}
+
+async function reconcilePositions() {
+    if (DRY_RUN) {
+        console.log('🧪 DRY_RUN 모드: 실계좌-DB 동기화 점검은 생략합니다.');
+        return {
+            checkedMarkets: TARGET_MARKETS.length,
+            mismatches: 0,
+            recoveredCount: 0,
+            closedCount: 0,
+            qtyAdjustedCount: 0
+        };
+    }
+
+    console.log('🔄 업비트 계좌와 DB 포지션 동기화 점검 시작...');
+
+    const report = {
+        checkedMarkets: 0,
+        mismatches: 0,
+        recoveredCount: 0,
+        closedCount: 0,
+        qtyAdjustedCount: 0
+    };
+
+    const accounts = await getAccounts();
+    const accountByCurrency = new Map(accounts.map((a) => [a.currency, a]));
+
+    const tickerRes = await axios.get(`https://api.upbit.com/v1/ticker?markets=${TARGET_MARKETS.join(',')}`);
+    const tickerByMarket = new Map((tickerRes.data || []).map((t) => [t.market, Number(t.trade_price || 0)]));
+
+    for (const market of TARGET_MARKETS) {
+        report.checkedMarkets += 1;
+        const dbPosition = await getOpenPosition(market, DRY_RUN);
+        const currency = getBaseCurrency(market);
+        const account = accountByCurrency.get(currency);
+
+        const balance = Number(account?.balance || 0);
+        const locked = Number(account?.locked || 0);
+        const actualQty = balance + locked;
+        const currentPrice = tickerByMarket.get(market) || 0;
+        const avgBuyPrice = Number(account?.avg_buy_price || 0);
+
+        if (actualQty > POSITION_SYNC_DUST_QTY && !dbPosition) {
+            report.mismatches += 1;
+            report.recoveredCount += 1;
+            const entryPrice = avgBuyPrice > 0 ? avgBuyPrice : currentPrice;
+            const trailDistance = computeTrailingDistance(entryPrice, null);
+            const trailingStop = Math.max(entryPrice - trailDistance, 1);
+
+            await createOpenPosition({
+                market,
+                entry_price: entryPrice,
+                quantity_btc: actualQty,
+                invested_krw: actualQty * entryPrice,
+                highest_price: currentPrice > 0 ? currentPrice : entryPrice,
+                trailing_stop_price: trailingStop,
+                atr_at_entry: null,
+                entry_reason: `[${market}] SYSTEM_RECOVERY: 실계좌 보유분을 DB에 복구`,
+                is_simulated: DRY_RUN,
+                take_profit_done: false
+            });
+
+            console.log(`✅ 동기화 복구(${market}): 실계좌 보유분을 DB OPEN 포지션으로 생성`);
+            continue;
+        }
+
+        if (actualQty <= POSITION_SYNC_DUST_QTY && dbPosition) {
+            report.mismatches += 1;
+            report.closedCount += 1;
+            const exitPrice = currentPrice > 0 ? currentPrice : Number(dbPosition.entry_price);
+            await closePosition(dbPosition.id, exitPrice, `[${market}] SYSTEM_SYNC: 실계좌 잔고 없음으로 포지션 종료`);
+            console.log(`✅ 동기화 정리(${market}): DB OPEN 포지션을 종료`);
+            continue;
+        }
+
+        if (actualQty > POSITION_SYNC_DUST_QTY && dbPosition) {
+            const dbQty = Number(dbPosition.quantity_btc || 0);
+            const qtyGap = Math.abs(actualQty - dbQty);
+            const tolerance = Math.max(POSITION_SYNC_DUST_QTY, actualQty * 0.02);
+
+            if (qtyGap > tolerance) {
+                report.mismatches += 1;
+                report.qtyAdjustedCount += 1;
+                await updateOpenPosition(dbPosition.id, {
+                    quantity_btc: actualQty,
+                    invested_krw: actualQty * Number(dbPosition.entry_price)
+                });
+                console.log(`✅ 동기화 보정(${market}): 수량 차이 ${qtyGap.toFixed(8)}를 DB에 반영`);
+            }
+        }
+    }
+
+    const details = `checked=${report.checkedMarkets}, mismatches=${report.mismatches}, recovered=${report.recoveredCount}, closed=${report.closedCount}, adjusted=${report.qtyAdjustedCount}`;
+    await upsertSyncReport({
+        report_date: new Date().toISOString().slice(0, 10),
+        is_simulated: DRY_RUN,
+        checked_markets: report.checkedMarkets,
+        mismatches: report.mismatches,
+        recovered_count: report.recoveredCount,
+        closed_count: report.closedCount,
+        qty_adjusted_count: report.qtyAdjustedCount,
+        details
+    });
+
+    if (SYNC_REPORT_AS_AI_LOG) {
+        await saveAILog({
+            decision: 'HOLD',
+            sentiment_score: clamp(report.mismatches * 10, 0, 100),
+            analysis_reason: `[SYNC-REPORT] ${details}`,
+            is_simulated: DRY_RUN
+        });
+    }
+
+    console.log(`🧾 동기화 리포트: ${details}`);
+    console.log('✅ 계좌-DB 동기화 점검 완료');
+    return report;
 }
 
 function combineDecision(aiResult, technicalSignal) {
@@ -228,30 +557,19 @@ async function runBot() {
 
                     console.log(`📉 [청산:${market}] ${exitReason}`);
 
-                    if (!DRY_RUN) {
-                        const volume = await getMarketVolume(market);
-                        if (volume <= 0) {
-                            console.log(`⚠️ 실제 보유 수량이 없어 매도 주문을 생략합니다. (${market})`);
-                            await sleep(MARKET_LOOP_DELAY_MS);
-                            continue;
-                        }
-
-                        const sellRes = await sellMarket(market, volume);
-                        console.log('✅ 매도 주문 완료:', sellRes.uuid || '(uuid 없음)');
-                    } else {
-                        console.log('🧪 DRY_RUN 모드: 실제 매도 주문은 생략했습니다.');
-                    }
-
-                    await saveTrade({
-                        side: 'sell',
-                        price: currentPrice,
-                        amount: positionInvested,
-                        reason: `[${market}] ${exitReason}`,
-                        is_simulated: DRY_RUN
+                    const exited = await executeExitFlow({
+                        market,
+                        currentPrice,
+                        positionQty,
+                        positionInvested,
+                        positionId: openPosition.id,
+                        exitReason
                     });
 
-                    await closePosition(openPosition.id, currentPrice, exitReason);
-                    console.log(`✅ 포지션 종료 및 DB 기록 완료 (${market})`);
+                    if (!exited) {
+                        console.log(`⚠️ [${market}] 청산 실패로 포지션을 유지하고 다음 루프에서 재시도합니다.`);
+                    }
+
                     await sleep(MARKET_LOOP_DELAY_MS);
                     continue;
                 }
@@ -262,43 +580,96 @@ async function runBot() {
                 if (takeProfitTriggered) {
                     const partialRatio = clamp(TAKE_PROFIT_SELL_RATIO, 0.1, 0.9);
                     const partialQty = positionQty * partialRatio;
-                    const remainQty = positionQty - partialQty;
-                    const partialInvested = positionInvested * partialRatio;
-                    const remainInvested = positionInvested - partialInvested;
                     const limitPrice = computeTakeProfitLimitPrice(currentPrice, takeProfitPrice);
 
                     console.log(`💸 [부분익절:${market}] 목표가 도달: ${Math.round(takeProfitPrice).toLocaleString()}원 (${TAKE_PROFIT_PCT}%)`);
 
                     if (!DRY_RUN) {
+                        const tpOrderStatus = await managePartialTakeProfitOrders(market);
+                        if (tpOrderStatus.hasActiveFreshOrder) {
+                            console.log(`⏳ [${market}] 이미 미체결 매도 주문이 있어 추가 부분익절 주문은 생략합니다.`);
+                            await sleep(MARKET_LOOP_DELAY_MS);
+                            continue;
+                        }
+
                         const volume = await getMarketVolume(market);
                         const sellQty = Math.min(volume, partialQty);
                         if (sellQty > 0) {
                             const sellRes = await sellLimit(market, sellQty.toFixed(8), limitPrice);
                             console.log(`✅ 부분익절 지정가 주문 완료: ${limitPrice.toLocaleString()}원`, sellRes.uuid || '(uuid 없음)');
+
+                            await sleep(LIMIT_FILL_CHECK_DELAY_MS);
+                            const orderState = await getOrder(sellRes.uuid);
+                            if (orderState?.state !== 'done') {
+                                console.log(`⏳ [${market}] 부분익절 지정가가 아직 미체결(state=${orderState?.state || 'unknown'})입니다. 다음 루프에서 TTL 재호가를 검토합니다.`);
+                                await sleep(MARKET_LOOP_DELAY_MS);
+                                continue;
+                            }
+
+                            const executed = parseOrderExecution(orderState, currentPrice, sellQty);
+                            if (executed.executedVolume <= POSITION_SYNC_DUST_QTY) {
+                                console.log(`⚠️ [${market}] 체결수량이 0에 가까워 DB 반영을 보류합니다.`);
+                                await sleep(MARKET_LOOP_DELAY_MS);
+                                continue;
+                            }
+
+                            const costBasis = computeCostBasis(positionInvested, positionQty, executed.executedVolume);
+                            const remainQty = Math.max(0, positionQty - executed.executedVolume);
+                            const remainInvested = Math.max(0, positionInvested - costBasis);
+                            const realizedPnl = executed.netProceeds - costBasis;
+
+                            await saveTrade({
+                                side: 'sell',
+                                price: executed.avgPrice,
+                                amount: executed.netProceeds,
+                                reason: `[${market}] 부분익절 체결 | exec_qty=${executed.executedVolume.toFixed(8)} | fee=${Math.round(executed.paidFee)} | pnl=${Math.round(realizedPnl)} | limit=${limitPrice}`,
+                                is_simulated: DRY_RUN
+                            });
+
+                            if (remainQty <= POSITION_SYNC_DUST_QTY) {
+                                await closePosition(openPosition.id, executed.avgPrice, `[${market}] 부분익절 체결로 전량 종료 | pnl=${Math.round(realizedPnl)}`);
+                                console.log(`✅ 부분익절 체결로 포지션 종료(${market})`);
+                            } else {
+                                await updateOpenPosition(openPosition.id, {
+                                    quantity_btc: remainQty,
+                                    invested_krw: remainInvested,
+                                    take_profit_done: true,
+                                    highest_price: nextHighest,
+                                    trailing_stop_price: nextStop
+                                });
+                                console.log(`✅ 부분익절 체결 반영(${market}): exec=${executed.executedVolume.toFixed(8)} BTC, 잔여=${remainQty.toFixed(8)} BTC`);
+                            }
                         } else {
                             console.log('⚠️ 부분익절 가능한 보유 수량이 없어 주문을 생략합니다.');
+                            await sleep(MARKET_LOOP_DELAY_MS);
+                            continue;
                         }
                     } else {
                         console.log('🧪 DRY_RUN 모드: 부분익절 주문은 생략했습니다.');
+
+                        const remainQty = Math.max(0, positionQty - partialQty);
+                        const partialInvested = computeCostBasis(positionInvested, positionQty, partialQty);
+                        const remainInvested = Math.max(0, positionInvested - partialInvested);
+
+                        await saveTrade({
+                            side: 'sell',
+                            price: currentPrice,
+                            amount: partialInvested,
+                            reason: `[${market}] 부분익절 ${Math.round(partialRatio * 100)}% 실행(지정가 ${limitPrice})`,
+                            is_simulated: DRY_RUN
+                        });
+
+                        await updateOpenPosition(openPosition.id, {
+                            quantity_btc: remainQty,
+                            invested_krw: remainInvested,
+                            take_profit_done: true,
+                            highest_price: nextHighest,
+                            trailing_stop_price: nextStop
+                        });
+
+                        console.log(`✅ 부분익절 완료(${market}): 잔여 수량=${remainQty.toFixed(8)} BTC`);
                     }
 
-                    await saveTrade({
-                        side: 'sell',
-                        price: currentPrice,
-                        amount: partialInvested,
-                        reason: `[${market}] 부분익절 ${Math.round(partialRatio * 100)}% 실행(지정가 ${limitPrice})`,
-                        is_simulated: DRY_RUN
-                    });
-
-                    await updateOpenPosition(openPosition.id, {
-                        quantity_btc: remainQty,
-                        invested_krw: remainInvested,
-                        take_profit_done: true,
-                        highest_price: nextHighest,
-                        trailing_stop_price: nextStop
-                    });
-
-                    console.log(`✅ 부분익절 완료(${market}): 잔여 수량=${remainQty.toFixed(8)} BTC`);
                     await sleep(MARKET_LOOP_DELAY_MS);
                     continue;
                 }
@@ -316,41 +687,45 @@ async function runBot() {
             });
 
             if (combined.finalDecision === 'BUY') {
-            const orderKrw = computeOrderSizeKrw(currentPrice, technicalSignal);
-            const qty = orderKrw / currentPrice;
-            const initialStop = currentPrice - computeTrailingDistance(currentPrice, technicalSignal.atr);
+                const orderKrw = computeOrderSizeKrw(currentPrice, technicalSignal);
+                const qty = orderKrw / currentPrice;
+                const initialStop = currentPrice - computeTrailingDistance(currentPrice, technicalSignal.atr);
 
-            console.log(`💰 [실행:${market}] 신규 진입: ${orderKrw.toLocaleString()}원 (변동성 기반) 매수 시도.`);
+                console.log(`💰 [실행:${market}] 신규 진입: ${orderKrw.toLocaleString()}원 (변동성 기반) 매수 시도.`);
 
-            if (!DRY_RUN) {
-                const orderRes = await buyMarket(market, orderKrw);
-                console.log('✅ 매수 주문 완료:', orderRes.uuid || '(uuid 없음)');
-            } else {
-                console.log('🧪 DRY_RUN 모드: 실제 주문은 생략했습니다.');
-            }
+                if (!DRY_RUN) {
+                    const orderRes = await buyMarket(market, orderKrw);
+                    console.log('✅ 매수 주문 완료:', orderRes.uuid || '(uuid 없음)');
+                } else {
+                    console.log('🧪 DRY_RUN 모드: 실제 주문은 생략했습니다.');
+                }
 
-            await saveTrade({
-                side: 'buy',
-                price: currentPrice,
-                amount: orderKrw,
-                reason: `[${market}] ${aiResult.reason} | ${technicalSignal.reason} | stop=${Math.round(initialStop)}`,
-                is_simulated: DRY_RUN
-            });
+                await saveTrade({
+                    side: 'buy',
+                    price: currentPrice,
+                    amount: orderKrw,
+                    reason: `[${market}] ${aiResult.reason} | ${technicalSignal.reason} | stop=${Math.round(initialStop)}`,
+                    is_simulated: DRY_RUN
+                });
 
-            await createOpenPosition({
-                market,
-                entry_price: currentPrice,
-                quantity_btc: qty,
-                invested_krw: orderKrw,
-                highest_price: currentPrice,
-                trailing_stop_price: initialStop,
-                atr_at_entry: technicalSignal.atr,
-                entry_reason: `[${market}] ${aiResult.reason} | ${technicalSignal.reason}`,
-                is_simulated: DRY_RUN,
-                take_profit_done: false
-            });
+                const createdPosition = await createOpenPosition({
+                    market,
+                    entry_price: currentPrice,
+                    quantity_btc: qty,
+                    invested_krw: orderKrw,
+                    highest_price: currentPrice,
+                    trailing_stop_price: initialStop,
+                    atr_at_entry: technicalSignal.atr,
+                    entry_reason: `[${market}] ${aiResult.reason} | ${technicalSignal.reason}`,
+                    is_simulated: DRY_RUN,
+                    take_profit_done: false
+                });
 
-            console.log(`✅ 매수 기록 DB 저장 완료 (${market})`);
+                if (!createdPosition) {
+                    console.log(`🚨 [${market}] DB 포지션 생성 실패. 다음 동기화 점검에서 실계좌 기준으로 복구를 시도합니다.`);
+                } else {
+                    console.log(`✅ 매수 기록 DB 저장 완료 (${market})`);
+                }
             }
             else {
                 console.log(`😴 [대기:${market}] 매매 조건이 충족되지 않았습니다.`);
@@ -380,6 +755,7 @@ async function runBot() {
 
 let isRunning = false;
 let isMonitorRunning = false;
+let isSyncRunning = false;
 
 async function runBotSafely() {
     if (isRunning) {
@@ -439,27 +815,19 @@ async function runPriceMonitor() {
                 const exitReason = `모니터링 트레일링 스탑 발동: 현재가(${Math.round(currentPrice)}) <= 스탑(${Math.round(nextStop)})`;
                 console.log(`📉 [모니터링 청산:${market}] ${exitReason}`);
 
-                if (!DRY_RUN) {
-                    const volume = await getMarketVolume(market);
-                    if (volume > 0) {
-                        const sellRes = await sellMarket(market, volume);
-                        console.log('✅ 모니터링 매도 주문 완료:', sellRes.uuid || '(uuid 없음)');
-                    } else {
-                        console.log(`⚠️ 실제 보유 수량이 없어 모니터링 매도를 생략합니다. (${market})`);
-                    }
-                } else {
-                    console.log('🧪 DRY_RUN 모드: 모니터링 매도 주문은 생략했습니다.');
-                }
-
-                await saveTrade({
-                    side: 'sell',
-                    price: currentPrice,
-                    amount: positionInvested,
-                    reason: `[${market}] ${exitReason}`,
-                    is_simulated: DRY_RUN
+                const exited = await executeExitFlow({
+                    market,
+                    currentPrice,
+                    positionQty,
+                    positionInvested,
+                    positionId: openPosition.id,
+                    exitReason
                 });
 
-                await closePosition(openPosition.id, currentPrice, exitReason);
+                if (!exited) {
+                    console.log(`⚠️ [${market}] 모니터링 청산 실패로 포지션을 유지하고 다음 루프에서 재시도합니다.`);
+                }
+
                 await sleep(MARKET_LOOP_DELAY_MS);
                 continue;
             }
@@ -470,41 +838,93 @@ async function runPriceMonitor() {
             if (takeProfitTriggered) {
                 const partialRatio = clamp(TAKE_PROFIT_SELL_RATIO, 0.1, 0.9);
                 const partialQty = positionQty * partialRatio;
-                const remainQty = positionQty - partialQty;
-                const partialInvested = positionInvested * partialRatio;
-                const remainInvested = positionInvested - partialInvested;
                 const limitPrice = computeTakeProfitLimitPrice(currentPrice, takeProfitPrice);
 
                 console.log(`💸 [모니터링 부분익절:${market}] 목표가 도달: ${Math.round(takeProfitPrice).toLocaleString()}원 (${TAKE_PROFIT_PCT}%)`);
 
                 if (!DRY_RUN) {
+                    const tpOrderStatus = await managePartialTakeProfitOrders(market);
+                    if (tpOrderStatus.hasActiveFreshOrder) {
+                        console.log(`⏳ [${market}] 이미 미체결 매도 주문이 있어 추가 부분익절 주문은 생략합니다.`);
+                        await sleep(MARKET_LOOP_DELAY_MS);
+                        continue;
+                    }
+
                     const volume = await getMarketVolume(market);
                     const sellQty = Math.min(volume, partialQty);
                     if (sellQty > 0) {
                         const sellRes = await sellLimit(market, sellQty.toFixed(8), limitPrice);
                         console.log(`✅ 모니터링 부분익절 지정가 주문 완료: ${limitPrice.toLocaleString()}원`, sellRes.uuid || '(uuid 없음)');
+
+                        await sleep(LIMIT_FILL_CHECK_DELAY_MS);
+                        const orderState = await getOrder(sellRes.uuid);
+                        if (orderState?.state !== 'done') {
+                            console.log(`⏳ [${market}] 부분익절 지정가가 아직 미체결(state=${orderState?.state || 'unknown'})입니다. 다음 루프에서 TTL 재호가를 검토합니다.`);
+                            await sleep(MARKET_LOOP_DELAY_MS);
+                            continue;
+                        }
+
+                        const executed = parseOrderExecution(orderState, currentPrice, sellQty);
+                        if (executed.executedVolume <= POSITION_SYNC_DUST_QTY) {
+                            console.log(`⚠️ [${market}] 체결수량이 0에 가까워 DB 반영을 보류합니다.`);
+                            await sleep(MARKET_LOOP_DELAY_MS);
+                            continue;
+                        }
+
+                        const costBasis = computeCostBasis(positionInvested, positionQty, executed.executedVolume);
+                        const remainQty = Math.max(0, positionQty - executed.executedVolume);
+                        const remainInvested = Math.max(0, positionInvested - costBasis);
+                        const realizedPnl = executed.netProceeds - costBasis;
+
+                        await saveTrade({
+                            side: 'sell',
+                            price: executed.avgPrice,
+                            amount: executed.netProceeds,
+                            reason: `[${market}] 모니터링 부분익절 체결 | exec_qty=${executed.executedVolume.toFixed(8)} | fee=${Math.round(executed.paidFee)} | pnl=${Math.round(realizedPnl)} | limit=${limitPrice}`,
+                            is_simulated: DRY_RUN
+                        });
+
+                        if (remainQty <= POSITION_SYNC_DUST_QTY) {
+                            await closePosition(openPosition.id, executed.avgPrice, `[${market}] 모니터링 부분익절 체결로 전량 종료 | pnl=${Math.round(realizedPnl)}`);
+                            console.log(`✅ 모니터링 부분익절 체결로 포지션 종료(${market})`);
+                        } else {
+                            await updateOpenPosition(openPosition.id, {
+                                quantity_btc: remainQty,
+                                invested_krw: remainInvested,
+                                take_profit_done: true,
+                                highest_price: nextHighest,
+                                trailing_stop_price: nextStop
+                            });
+                            console.log(`✅ 모니터링 부분익절 체결 반영(${market}): exec=${executed.executedVolume.toFixed(8)} BTC, 잔여=${remainQty.toFixed(8)} BTC`);
+                        }
                     } else {
                         console.log('⚠️ 부분익절 가능한 보유 수량이 없어 주문을 생략합니다.');
+                        await sleep(MARKET_LOOP_DELAY_MS);
+                        continue;
                     }
                 } else {
                     console.log('🧪 DRY_RUN 모드: 부분익절 주문은 생략했습니다.');
+
+                    const remainQty = Math.max(0, positionQty - partialQty);
+                    const partialInvested = computeCostBasis(positionInvested, positionQty, partialQty);
+                    const remainInvested = Math.max(0, positionInvested - partialInvested);
+
+                    await saveTrade({
+                        side: 'sell',
+                        price: currentPrice,
+                        amount: partialInvested,
+                        reason: `[${market}] 모니터링 부분익절 ${Math.round(partialRatio * 100)}% 실행(지정가 ${limitPrice})`,
+                        is_simulated: DRY_RUN
+                    });
+
+                    await updateOpenPosition(openPosition.id, {
+                        quantity_btc: remainQty,
+                        invested_krw: remainInvested,
+                        take_profit_done: true,
+                        highest_price: nextHighest,
+                        trailing_stop_price: nextStop
+                    });
                 }
-
-                await saveTrade({
-                    side: 'sell',
-                    price: currentPrice,
-                    amount: partialInvested,
-                    reason: `[${market}] 모니터링 부분익절 ${Math.round(partialRatio * 100)}% 실행(지정가 ${limitPrice})`,
-                    is_simulated: DRY_RUN
-                });
-
-                await updateOpenPosition(openPosition.id, {
-                    quantity_btc: remainQty,
-                    invested_krw: remainInvested,
-                    take_profit_done: true,
-                    highest_price: nextHighest,
-                    trailing_stop_price: nextStop
-                });
             }
 
             await sleep(MARKET_LOOP_DELAY_MS);
@@ -528,8 +948,32 @@ async function runPriceMonitorSafely() {
     }
 }
 
+async function runReconciliationSafely() {
+    if (isSyncRunning) {
+        console.log('⏭️ 이전 동기화 점검이 아직 진행 중이라 이번 점검은 건너뜁니다.');
+        return;
+    }
+
+    isSyncRunning = true;
+    try {
+        const report = await reconcilePositions();
+        if (report) {
+            console.log(`📣 일일 동기화 알림: 점검 ${report.checkedMarkets}개 마켓, 불일치 ${report.mismatches}건, 복구 ${report.recoveredCount}건, 종료 ${report.closedCount}건, 수량보정 ${report.qtyAdjustedCount}건`);
+        }
+    } catch (err) {
+        console.error('❌ 포지션 동기화 점검 중 오류:', err.response?.data || err.message);
+    } finally {
+        isSyncRunning = false;
+    }
+}
+
 if (RUN_ONCE) {
-    runBotSafely();
+    (async () => {
+        if (POSITION_SYNC_ON_START) {
+            await runReconciliationSafely();
+        }
+        await runBotSafely();
+    })();
 } else {
     cron.schedule(BOT_CRON, async () => {
         console.log(`⏰ 정각 스케줄 실행(${BOT_CRON}): ${new Date().toLocaleString()}`);
@@ -540,9 +984,19 @@ if (RUN_ONCE) {
         await runPriceMonitorSafely();
     });
 
-    console.log(`🤖 봇 대기 중... 스케줄러 작동 시작 (BOT_CRON=${BOT_CRON}, PRICE_MONITOR_CRON=${PRICE_MONITOR_CRON})`);
-    runBotSafely();
-    runPriceMonitorSafely();
+    cron.schedule(POSITION_SYNC_CRON, async () => {
+        console.log(`🧭 포지션 동기화 점검 실행(${POSITION_SYNC_CRON}): ${new Date().toLocaleString()}`);
+        await runReconciliationSafely();
+    });
+
+    console.log(`🤖 봇 대기 중... 스케줄러 작동 시작 (BOT_CRON=${BOT_CRON}, PRICE_MONITOR_CRON=${PRICE_MONITOR_CRON}, POSITION_SYNC_CRON=${POSITION_SYNC_CRON})`);
+    (async () => {
+        if (POSITION_SYNC_ON_START) {
+            await runReconciliationSafely();
+        }
+        await runBotSafely();
+        await runPriceMonitorSafely();
+    })();
 
     if (AUTO_STOP_MINUTES > 0) {
         console.log(`⏳ 자동 종료 예약: ${AUTO_STOP_MINUTES}분 후 프로세스를 종료합니다.`);

@@ -109,6 +109,52 @@ async function sellLimit(market, volume, price) {
     }
 }
 
+// 미체결 주문 조회 함수
+async function getOpenOrders(market, side = null) {
+    const params = {
+        market,
+        state: 'wait'
+    };
+
+    if (side) {
+        params.side = side;
+    }
+
+    try {
+        const res = await requestUpbit('GET', '/v1/orders', { params });
+        return Array.isArray(res.data) ? res.data : [];
+    } catch (error) {
+        console.error('❌ 미체결 주문 조회 에러:', error.response?.data || error.message);
+        return [];
+    }
+}
+
+// 주문 취소 함수
+async function cancelOrder(uuid) {
+    try {
+        const res = await requestUpbit('DELETE', '/v1/order', {
+            params: { uuid }
+        });
+        return res.data;
+    } catch (error) {
+        console.error('❌ 주문 취소 에러:', error.response?.data || error.message);
+        throw error;
+    }
+}
+
+// 단일 주문 상태 조회 함수
+async function getOrder(uuid) {
+    try {
+        const res = await requestUpbit('GET', '/v1/order', {
+            params: { uuid }
+        });
+        return res.data;
+    } catch (error) {
+        console.error('❌ 주문 상태 조회 에러:', error.response?.data || error.message);
+        return null;
+    }
+}
+
 async function getAccounts() {
     try {
         const res = await requestUpbit('GET', '/v1/accounts');
@@ -194,6 +240,9 @@ module.exports = {
     buyMarket,
     sellMarket,
     sellLimit,
+    getOpenOrders,
+    cancelOrder,
+    getOrder,
     getAccounts,
     getMarketVolume,
     getLiveAccountSummary
