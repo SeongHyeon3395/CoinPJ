@@ -56,10 +56,11 @@ async function requestUpbit(method, path, options = {}) {
 
 // 시장가 매수 함수
 async function buyMarket(market, amount) {
+    const normalizedAmount = Number(amount);
     const body = {
         market: market,
         side: 'bid', // 매수
-        price: amount, // 시장가 매수 시에는 'price'가 주문 총액
+        price: String(normalizedAmount), // 시장가 매수 시에는 'price'가 주문 총액
         ord_type: 'price', // 시장가 매수
     };
 
@@ -74,10 +75,11 @@ async function buyMarket(market, amount) {
 
 // 시장가 매도 함수 (전량 매도)
 async function sellMarket(market, volume) {
+    const normalizedVolume = Number(volume);
     const body = {
         market: market,
         side: 'ask', // 매도
-        volume: volume, // 매도 수량
+        volume: String(normalizedVolume), // 매도 수량
         ord_type: 'market', // 시장가 매도
     };
 
@@ -92,11 +94,13 @@ async function sellMarket(market, volume) {
 
 // 지정가 매도 함수
 async function sellLimit(market, volume, price) {
+    const normalizedVolume = Number(volume);
+    const normalizedPrice = Number(price);
     const body = {
         market: market,
         side: 'ask', // 매도
-        volume: volume, // 매도 수량
-        price: String(price), // 지정가
+        volume: String(normalizedVolume), // 매도 수량
+        price: String(normalizedPrice), // 지정가
         ord_type: 'limit' // 지정가 매도
     };
 

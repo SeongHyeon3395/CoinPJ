@@ -52,6 +52,15 @@ const TARGET_MARKETS = (process.env.TARGET_MARKETS || 'KRW-BTC,KRW-ETH,KRW-XRP')
     .split(',')
     .map((m) => m.trim())
     .filter(Boolean);
+const ENABLE_SURGING_ALT_MARKETS = process.env.ENABLE_SURGING_ALT_MARKETS !== 'false';
+const SURGING_ALT_COUNT = Number(process.env.SURGING_ALT_COUNT || 5);
+const SURGING_ALT_MIN_CHANGE_PCT = Number(process.env.SURGING_ALT_MIN_CHANGE_PCT || 3.0);
+const SURGING_ALT_MIN_24H_KRW = Number(process.env.SURGING_ALT_MIN_24H_KRW || 10000000000);
+const SURGING_ALT_EXCLUDE = (process.env.SURGING_ALT_EXCLUDE || 'BTC,ETH,XRP')
+    .split(',')
+    .map((s) => s.trim().toUpperCase())
+    .filter(Boolean);
+const DUST_CLOSE_KRW = Number(process.env.DUST_CLOSE_KRW || 2000);
 const MARKET_LOOP_DELAY_MS = Number(process.env.MARKET_LOOP_DELAY_MS || 500);
 const CANCEL_SETTLE_DELAY_MS = Number(process.env.CANCEL_SETTLE_DELAY_MS || 1000);
 const LIMIT_FILL_CHECK_DELAY_MS = Number(process.env.LIMIT_FILL_CHECK_DELAY_MS || 2500);
@@ -119,6 +128,69 @@ function computeTakeProfitLimitPrice(currentPrice, takeProfitPrice) {
 
 function getBaseCurrency(market) {
     return market.split('-')[1];
+}
+
+function uniqueMarkets(markets) {
+    return [...new Set(markets.filter((m) => typeof m === 'string' && m.startsWith('KRW-')))];
+}
+
+async function getSurgingAltMarkets(baseMarkets) {
+    if (!ENABLE_SURGING_ALT_MARKETS || SURGING_ALT_COUNT <= 0) {
+        return [];
+    }
+
+    try {
+        const baseSet = new Set(baseMarkets);
+        const marketRes = await axios.get('https://api.upbit.com/v1/market/all', {
+            params: { isDetails: false }
+        });
+
+        const allKrwMarkets = (marketRes.data || [])
+            .map((m) => m.market)
+            .filter((m) => typeof m === 'string' && m.startsWith('KRW-'))
+            .filter((m) => !baseSet.has(m))
+            .filter((m) => !SURGING_ALT_EXCLUDE.includes(getBaseCurrency(m)));
+
+        if (!allKrwMarkets.length) {
+            return [];
+        }
+
+        const tickerRes = await axios.get('https://api.upbit.com/v1/ticker', {
+            params: { markets: allKrwMarkets.join(',') }
+        });
+
+        const minChange = SURGING_ALT_MIN_CHANGE_PCT / 100;
+        const tickerList = tickerRes.data || [];
+        const picked = tickerList
+            .filter((t) => Number(t.signed_change_rate || 0) >= minChange)
+            .filter((t) => Number(t.acc_trade_price_24h || 0) >= SURGING_ALT_MIN_24H_KRW)
+            .sort((a, b) => {
+                const changeDiff = Number(b.signed_change_rate || 0) - Number(a.signed_change_rate || 0);
+                if (Math.abs(changeDiff) > 0.000001) return changeDiff;
+                return Number(b.acc_trade_price_24h || 0) - Number(a.acc_trade_price_24h || 0);
+            })
+            .slice(0, SURGING_ALT_COUNT)
+            .map((t) => t.market);
+
+        if (picked.length > 0) {
+            const byMarket = new Map(tickerList.map((t) => [t.market, t]));
+            const summary = picked
+                .map((m) => `${m}(${((byMarket.get(m)?.signed_change_rate || 0) * 100).toFixed(2)}%)`)
+                .join(', ');
+            console.log(`🔥 급등 잡코인 스캔 결과: ${summary}`);
+        }
+
+        return picked;
+    } catch (error) {
+        console.error('⚠️ 급등 잡코인 스캔 실패, 고정 마켓만 사용합니다:', error.response?.data || error.message);
+        return [];
+    }
+}
+
+async function resolveTargetMarkets() {
+    const baseMarkets = uniqueMarkets(TARGET_MARKETS);
+    const surgingAltMarkets = await getSurgingAltMarkets(baseMarkets);
+    return uniqueMarkets([...baseMarkets, ...surgingAltMarkets]);
 }
 
 function parseOrderExecution(order, fallbackPrice = 0, fallbackVolume = 0) {
@@ -245,6 +317,18 @@ async function executeExitFlow({ market, currentPrice, positionQty, positionInve
             return false;
         }
 
+        const estimatedNotional = volume * currentPrice;
+        if (estimatedNotional < MIN_ORDER_KRW) {
+            if (estimatedNotional <= DUST_CLOSE_KRW) {
+                await closePosition(positionId, currentPrice, `${exitReason} | 최소주문 미달 잔량(DUST ${Math.round(estimatedNotional)}원) 정리`);
+                console.log(`🧹 [${market}] 최소주문 미달 잔량(${Math.round(estimatedNotional)}원)을 DB에서 정리했습니다.`);
+                return true;
+            }
+
+            console.log(`⚠️ [${market}] 예상 매도금액 ${Math.round(estimatedNotional)}원이 최소주문 ${MIN_ORDER_KRW}원 미만이라 청산을 보류합니다.`);
+            return false;
+        }
+
         try {
             const sellRes = await sellMarket(market, volume);
             console.log('✅ 매도 주문 완료:', sellRes.uuid || '(uuid 없음)');
@@ -307,10 +391,12 @@ async function hasPendingAskOrder(market) {
 }
 
 async function reconcilePositions() {
+    const activeMarkets = await resolveTargetMarkets();
+
     if (DRY_RUN) {
         console.log('🧪 DRY_RUN 모드: 실계좌-DB 동기화 점검은 생략합니다.');
         return {
-            checkedMarkets: TARGET_MARKETS.length,
+            checkedMarkets: activeMarkets.length,
             mismatches: 0,
             recoveredCount: 0,
             closedCount: 0,
@@ -331,10 +417,15 @@ async function reconcilePositions() {
     const accounts = await getAccounts();
     const accountByCurrency = new Map(accounts.map((a) => [a.currency, a]));
 
-    const tickerRes = await axios.get(`https://api.upbit.com/v1/ticker?markets=${TARGET_MARKETS.join(',')}`);
+    if (!activeMarkets.length) {
+        console.log('⚠️ 동기화 대상 마켓이 없어 점검을 건너뜁니다.');
+        return report;
+    }
+
+    const tickerRes = await axios.get(`https://api.upbit.com/v1/ticker?markets=${activeMarkets.join(',')}`);
     const tickerByMarket = new Map((tickerRes.data || []).map((t) => [t.market, Number(t.trade_price || 0)]));
 
-    for (const market of TARGET_MARKETS) {
+    for (const market of activeMarkets) {
         report.checkedMarkets += 1;
         const dbPosition = await getOpenPosition(market, DRY_RUN);
         const currency = getBaseCurrency(market);
@@ -488,14 +579,20 @@ async function runBot() {
     }
 
     try {
-        const tickersRes = await axios.get(`https://api.upbit.com/v1/ticker?markets=${TARGET_MARKETS.join(',')}`);
+        const activeMarkets = await resolveTargetMarkets();
+        if (!activeMarkets.length) {
+            console.log('⚠️ 분석 대상 마켓이 없어 이번 루프를 종료합니다.');
+            return;
+        }
+
+        const tickersRes = await axios.get(`https://api.upbit.com/v1/ticker?markets=${activeMarkets.join(',')}`);
         const tickerByMarket = new Map(tickersRes.data.map((t) => [t.market, t]));
 
         // 무료 Tavily 한도를 고려해 뉴스는 1회 수집 후 모든 마켓에 공통 반영한다.
         console.log('🔍 최신 뉴스 수집 중... (공통 1회)');
         const sharedNews = await getCryptoNews('KRW-BTC');
 
-        for (const market of TARGET_MARKETS) {
+        for (const market of activeMarkets) {
             const ticker = tickerByMarket.get(market);
             if (!ticker) {
                 console.log(`⚠️ 현재가 없음(${market}): 해당 마켓은 건너뜁니다.`);
@@ -595,7 +692,27 @@ async function runBot() {
                         const volume = await getMarketVolume(market);
                         const sellQty = Math.min(volume, partialQty);
                         if (sellQty > 0) {
-                            const sellRes = await sellLimit(market, sellQty.toFixed(8), limitPrice);
+                            const estimatedNotional = sellQty * limitPrice;
+                            if (estimatedNotional < MIN_ORDER_KRW) {
+                                console.log(`⚠️ [${market}] 부분익절 예상금액 ${Math.round(estimatedNotional)}원이 최소주문 ${MIN_ORDER_KRW}원 미만이라 생략합니다.`);
+                                await updateOpenPosition(openPosition.id, {
+                                    take_profit_done: true,
+                                    highest_price: nextHighest,
+                                    trailing_stop_price: nextStop
+                                });
+                                await sleep(MARKET_LOOP_DELAY_MS);
+                                continue;
+                            }
+
+                            let sellRes;
+                            try {
+                                sellRes = await sellLimit(market, sellQty.toFixed(8), limitPrice);
+                            } catch (error) {
+                                console.error(`❌ 부분익절 주문 실패(${market}):`, error.response?.data || error.message);
+                                await sleep(MARKET_LOOP_DELAY_MS);
+                                continue;
+                            }
+
                             console.log(`✅ 부분익절 지정가 주문 완료: ${limitPrice.toLocaleString()}원`, sellRes.uuid || '(uuid 없음)');
 
                             await sleep(LIMIT_FILL_CHECK_DELAY_MS);
@@ -694,8 +811,14 @@ async function runBot() {
                 console.log(`💰 [실행:${market}] 신규 진입: ${orderKrw.toLocaleString()}원 (변동성 기반) 매수 시도.`);
 
                 if (!DRY_RUN) {
-                    const orderRes = await buyMarket(market, orderKrw);
-                    console.log('✅ 매수 주문 완료:', orderRes.uuid || '(uuid 없음)');
+                    try {
+                        const orderRes = await buyMarket(market, orderKrw);
+                        console.log('✅ 매수 주문 완료:', orderRes.uuid || '(uuid 없음)');
+                    } catch (error) {
+                        console.error(`❌ 매수 주문 실패(${market}):`, error.response?.data || error.message);
+                        await sleep(MARKET_LOOP_DELAY_MS);
+                        continue;
+                    }
                 } else {
                     console.log('🧪 DRY_RUN 모드: 실제 주문은 생략했습니다.');
                 }
@@ -773,10 +896,15 @@ async function runBotSafely() {
 
 async function runPriceMonitor() {
     try {
-        const tickersRes = await axios.get(`https://api.upbit.com/v1/ticker?markets=${TARGET_MARKETS.join(',')}`);
+        const activeMarkets = await resolveTargetMarkets();
+        if (!activeMarkets.length) {
+            return;
+        }
+
+        const tickersRes = await axios.get(`https://api.upbit.com/v1/ticker?markets=${activeMarkets.join(',')}`);
         const tickerByMarket = new Map(tickersRes.data.map((t) => [t.market, t]));
 
-        for (const market of TARGET_MARKETS) {
+        for (const market of activeMarkets) {
             const openPosition = await getOpenPosition(market, DRY_RUN);
             if (!openPosition) {
                 await sleep(MARKET_LOOP_DELAY_MS);
@@ -853,7 +981,27 @@ async function runPriceMonitor() {
                     const volume = await getMarketVolume(market);
                     const sellQty = Math.min(volume, partialQty);
                     if (sellQty > 0) {
-                        const sellRes = await sellLimit(market, sellQty.toFixed(8), limitPrice);
+                        const estimatedNotional = sellQty * limitPrice;
+                        if (estimatedNotional < MIN_ORDER_KRW) {
+                            console.log(`⚠️ [${market}] 모니터링 부분익절 예상금액 ${Math.round(estimatedNotional)}원이 최소주문 ${MIN_ORDER_KRW}원 미만이라 생략합니다.`);
+                            await updateOpenPosition(openPosition.id, {
+                                take_profit_done: true,
+                                highest_price: nextHighest,
+                                trailing_stop_price: nextStop
+                            });
+                            await sleep(MARKET_LOOP_DELAY_MS);
+                            continue;
+                        }
+
+                        let sellRes;
+                        try {
+                            sellRes = await sellLimit(market, sellQty.toFixed(8), limitPrice);
+                        } catch (error) {
+                            console.error(`❌ 모니터링 부분익절 주문 실패(${market}):`, error.response?.data || error.message);
+                            await sleep(MARKET_LOOP_DELAY_MS);
+                            continue;
+                        }
+
                         console.log(`✅ 모니터링 부분익절 지정가 주문 완료: ${limitPrice.toLocaleString()}원`, sellRes.uuid || '(uuid 없음)');
 
                         await sleep(LIMIT_FILL_CHECK_DELAY_MS);
