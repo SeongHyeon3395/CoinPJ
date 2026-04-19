@@ -67,6 +67,7 @@ const CANCEL_SETTLE_DELAY_MS = Number(process.env.CANCEL_SETTLE_DELAY_MS || 1000
 const LIMIT_FILL_CHECK_DELAY_MS = Number(process.env.LIMIT_FILL_CHECK_DELAY_MS || 2500);
 const PARTIAL_TP_ORDER_TTL_MS = Number(process.env.PARTIAL_TP_ORDER_TTL_MS || 300000);
 const POSITION_SYNC_ON_START = process.env.POSITION_SYNC_ON_START !== 'false';
+const BLOCK_TRADING_UNTIL_SYNC = process.env.BLOCK_TRADING_UNTIL_SYNC !== 'false';
 const POSITION_SYNC_DUST_QTY = Number(process.env.POSITION_SYNC_DUST_QTY || 0.00001);
 const SYNC_REPORT_AS_AI_LOG = process.env.SYNC_REPORT_AS_AI_LOG !== 'false';
 const AUTO_STOP_MINUTES = Number(process.env.AUTO_STOP_MINUTES || 0);
@@ -899,8 +900,14 @@ async function runBot() {
 let isRunning = false;
 let isMonitorRunning = false;
 let isSyncRunning = false;
+let hasCompletedInitialSync = !BLOCK_TRADING_UNTIL_SYNC;
 
 async function runBotSafely() {
+    if (BLOCK_TRADING_UNTIL_SYNC && !hasCompletedInitialSync) {
+        console.log('🛑 초기 동기화 완료 전이라 매매 루프를 건너뜁니다.');
+        return;
+    }
+
     if (isRunning) {
         console.log('⏭️ 이전 실행이 아직 진행 중이라 이번 스케줄은 건너뜁니다.');
         return;
@@ -1103,6 +1110,11 @@ async function runPriceMonitor() {
 }
 
 async function runPriceMonitorSafely() {
+    if (BLOCK_TRADING_UNTIL_SYNC && !hasCompletedInitialSync) {
+        console.log('🛑 초기 동기화 완료 전이라 가격 모니터링 루프를 건너뜁니다.');
+        return;
+    }
+
     if (isMonitorRunning) {
         console.log('⏭️ 이전 가격 모니터링이 아직 진행 중이라 이번 스케줄은 건너뜁니다.');
         return;
@@ -1119,17 +1131,23 @@ async function runPriceMonitorSafely() {
 async function runReconciliationSafely() {
     if (isSyncRunning) {
         console.log('⏭️ 이전 동기화 점검이 아직 진행 중이라 이번 점검은 건너뜁니다.');
-        return;
+        return false;
     }
 
     isSyncRunning = true;
     try {
         const report = await reconcilePositions();
+        if (!hasCompletedInitialSync) {
+            hasCompletedInitialSync = true;
+            console.log('🔓 초기 동기화 완료: 이제 매수/매도 루프를 허용합니다.');
+        }
         if (report) {
             console.log(`📣 일일 동기화 알림: 점검 ${report.checkedMarkets}개 마켓, 불일치 ${report.mismatches}건, 복구 ${report.recoveredCount}건, 종료 ${report.closedCount}건, 수량보정 ${report.qtyAdjustedCount}건`);
         }
+        return true;
     } catch (err) {
         console.error('❌ 포지션 동기화 점검 중 오류:', err.response?.data || err.message);
+        return false;
     } finally {
         isSyncRunning = false;
     }
@@ -1137,7 +1155,7 @@ async function runReconciliationSafely() {
 
 if (RUN_ONCE) {
     (async () => {
-        if (POSITION_SYNC_ON_START) {
+        if (POSITION_SYNC_ON_START || BLOCK_TRADING_UNTIL_SYNC) {
             await runReconciliationSafely();
         }
         await runBotSafely();
@@ -1159,8 +1177,10 @@ if (RUN_ONCE) {
 
     console.log(`🤖 봇 대기 중... 스케줄러 작동 시작 (BOT_CRON=${BOT_CRON}, PRICE_MONITOR_CRON=${PRICE_MONITOR_CRON}, POSITION_SYNC_CRON=${POSITION_SYNC_CRON})`);
     (async () => {
-        if (POSITION_SYNC_ON_START) {
+        if (POSITION_SYNC_ON_START || BLOCK_TRADING_UNTIL_SYNC) {
             await runReconciliationSafely();
+        } else {
+            hasCompletedInitialSync = true;
         }
         await runBotSafely();
         await runPriceMonitorSafely();

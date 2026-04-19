@@ -6,6 +6,8 @@
   "scripts": {
     "start": "node main.js",
     "start:once": "set RUN_ONCE=true&& node main.js",
+    "db:reset": "node scripts/reset-data.js",
+    "db:reset:yes": "node scripts/reset-data.js --yes",
     "test": "echo \"Error: no test specified\" && exit 1",
     "supabase:login": "npx supabase login",
     "supabase:link": "npx supabase link --project-ref algqbpberjlwbkpvosbl",
