@@ -609,6 +609,9 @@ async function runBot() {
 
         const tickersRes = await axios.get(`https://api.upbit.com/v1/ticker?markets=${activeMarkets.join(',')}`);
         const tickerByMarket = new Map(tickersRes.data.map((t) => [t.market, t]));
+        const accountByCurrency = DRY_RUN
+            ? new Map()
+            : new Map((await getAccounts()).map((a) => [a.currency, a]));
 
         // 뉴스는 캐시 기반으로 재사용하고 TTL 이후에만 재수집한다.
         const sharedNews = await getSharedNews();
@@ -635,7 +638,61 @@ async function runBot() {
             const aiResult = await getAIDecision(currentPrice, news, chartData, technicalSignal, market);
 
             const combined = combineDecision(aiResult, technicalSignal);
-            const openPosition = await getOpenPosition(market, DRY_RUN);
+            let openPosition = await getOpenPosition(market, DRY_RUN);
+
+            // 실계좌 상태를 우선 확인해 DB와 어긋났으면 즉시 복구/정리 후 이번 루프 거래는 건너뛴다.
+            if (!DRY_RUN) {
+                const currency = getBaseCurrency(market);
+                const account = accountByCurrency.get(currency);
+                const actualQty = Number(account?.balance || 0) + Number(account?.locked || 0);
+                const avgBuyPrice = Number(account?.avg_buy_price || 0);
+
+                if (actualQty > POSITION_SYNC_DUST_QTY && !openPosition) {
+                    const entryPrice = avgBuyPrice > 0 ? avgBuyPrice : currentPrice;
+                    const trailDistance = computeTrailingDistance(entryPrice, technicalSignal.atr);
+                    const trailingStop = Math.max(entryPrice - trailDistance, 1);
+
+                    await createOpenPosition({
+                        market,
+                        entry_price: entryPrice,
+                        quantity_btc: actualQty,
+                        invested_krw: actualQty * entryPrice,
+                        highest_price: currentPrice,
+                        trailing_stop_price: trailingStop,
+                        atr_at_entry: technicalSignal.atr,
+                        entry_reason: `[${market}] LIVE_GUARD_RECOVERY: 실계좌 보유분 반영`,
+                        is_simulated: false,
+                        take_profit_done: false
+                    });
+
+                    console.log(`🧩 [${market}] 실계좌 보유가 확인되어 DB 포지션을 복구했습니다. 이번 루프는 거래를 건너뜁니다.`);
+                    await sleep(MARKET_LOOP_DELAY_MS);
+                    continue;
+                }
+
+                if (actualQty <= POSITION_SYNC_DUST_QTY && openPosition) {
+                    await closePosition(openPosition.id, currentPrice, `[${market}] LIVE_GUARD_SYNC: 실계좌 잔고 없음 확인`);
+                    console.log(`🧩 [${market}] 실계좌 잔고가 없어 DB 포지션을 종료했습니다. 이번 루프는 거래를 건너뜁니다.`);
+                    await sleep(MARKET_LOOP_DELAY_MS);
+                    continue;
+                }
+
+                if (actualQty > POSITION_SYNC_DUST_QTY && openPosition) {
+                    const dbQty = Number(openPosition.quantity_btc || 0);
+                    const qtyGap = Math.abs(actualQty - dbQty);
+                    const tolerance = Math.max(POSITION_SYNC_DUST_QTY, actualQty * 0.02);
+
+                    if (qtyGap > tolerance) {
+                        await updateOpenPosition(openPosition.id, {
+                            quantity_btc: actualQty,
+                            invested_krw: actualQty * Number(openPosition.entry_price)
+                        });
+                        console.log(`🧩 [${market}] 실계좌 수량 기준으로 DB 포지션을 보정했습니다. (gap=${qtyGap.toFixed(8)})`);
+                        await sleep(MARKET_LOOP_DELAY_MS);
+                        continue;
+                    }
+                }
+            }
 
             console.log(`--- AI 분석: ${aiResult.decision} (${aiResult.percentage}%) ---`);
             console.log(`이유: ${aiResult.reason}`);
@@ -825,6 +882,15 @@ async function runBot() {
             });
 
             if (combined.finalDecision === 'BUY') {
+                if (!DRY_RUN) {
+                    const openBidOrders = await getOpenOrders(market, 'bid');
+                    if (openBidOrders.length > 0) {
+                        console.log(`⏳ [${market}] 미체결 매수 주문(${openBidOrders.length}건)이 있어 신규 진입을 건너뜁니다.`);
+                        await sleep(MARKET_LOOP_DELAY_MS);
+                        continue;
+                    }
+                }
+
                 const orderKrw = computeOrderSizeKrw(currentPrice, technicalSignal);
                 const qty = orderKrw / currentPrice;
                 const initialStop = currentPrice - computeTrailingDistance(currentPrice, technicalSignal.atr);
