@@ -203,12 +203,44 @@ async function getLiveAccountSummary() {
 
     if (markets.length > 0) {
         try {
-            const tickerRes = await axios.get(`https://api.upbit.com/v1/ticker?markets=${markets.join(',')}`);
+            const tickerRes = await axios.get('https://api.upbit.com/v1/ticker', {
+                params: { markets: markets.join(',') }
+            });
             for (const t of tickerRes.data || []) {
                 priceByMarket.set(t.market, Number(t.trade_price || 0));
             }
         } catch (error) {
-            console.error('⚠️ 평가가격 조회 실패(일부):', error.response?.data || error.message);
+            const status = error.response?.status;
+            const detail = error.response?.data || error.message;
+
+            if (status === 404) {
+                console.error('⚠️ 평가가격 일괄 조회 실패(404). 개별 마켓 재시도 후 유효 코인만 반영합니다:', detail);
+
+                const invalidMarkets = [];
+                for (const market of markets) {
+                    try {
+                        const singleTicker = await axios.get('https://api.upbit.com/v1/ticker', {
+                            params: { markets: market }
+                        });
+                        const first = Array.isArray(singleTicker.data) ? singleTicker.data[0] : null;
+                        if (first?.market) {
+                            priceByMarket.set(first.market, Number(first.trade_price || 0));
+                        }
+                    } catch (singleError) {
+                        if (singleError.response?.status === 404) {
+                            invalidMarkets.push(market);
+                            continue;
+                        }
+                        console.error(`⚠️ 평가가격 조회 실패(${market}):`, singleError.response?.data || singleError.message);
+                    }
+                }
+
+                if (invalidMarkets.length > 0) {
+                    console.error(`⚠️ 현재 조회 불가 마켓 코드 제외: ${invalidMarkets.join(', ')}`);
+                }
+            } else {
+                console.error('⚠️ 평가가격 조회 실패(일부):', detail);
+            }
         }
     }
 
