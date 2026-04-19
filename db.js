@@ -1,199 +1,183 @@
 // db.js
-require('dotenv').config();
-const { createClient } = require('@supabase/supabase-js');
+const fs = require('fs');
+const path = require('path');
 
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+// 1. 저장 경로 설정 (프로젝트 폴더 내 /data)
+const DATA_DIR = path.join(__dirname, 'data');
+const POSITIONS_FILE = path.join(DATA_DIR, 'positions.json');
+const HISTORY_FILE = path.join(DATA_DIR, 'trades_history.json');
 
-if (!supabaseUrl || !supabaseServiceRoleKey) {
-    console.error('❌ Supabase 환경변수 누락: SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY를 확인하세요.');
+// 호환성/운영 로그 파일
+const TRADES_FILE = path.join(DATA_DIR, 'trades.json');
+const AI_LOGS_FILE = path.join(DATA_DIR, 'ai_logs.json');
+const SYNC_REPORTS_FILE = path.join(DATA_DIR, 'sync_reports.json');
+
+// 2. 초기화: data 폴더가 없으면 스스로 만듭니다.
+if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    console.log("📁 데이터 저장용 'data' 폴더를 생성했습니다.");
 }
 
-const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
+// 3. 파일 읽기 도우미 함수
+function readJSON(filePath) {
+    try {
+        if (!fs.existsSync(filePath)) return [];
+        return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    } catch (e) {
+        return [];
+    }
+}
+
+// 4. 파일 쓰기 도우미 함수
+function writeJSON(filePath, data) {
+    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
+}
+
+/**
+ * [함수 1] 현재 보유 중인 포지션 확인
+ */
+async function getOpenPosition(market) {
+    const positions = readJSON(POSITIONS_FILE);
+    return positions.find((p) => p.market === market && p.status === 'OPEN') || null;
+}
+
+async function listOpenPositions() {
+    const positions = readJSON(POSITIONS_FILE);
+    return positions.filter((p) => p.status === 'OPEN');
+}
+
+/**
+ * [함수 2] 매수 직후 포지션 데이터 생성
+ */
+async function createOpenPosition(data) {
+    const positions = readJSON(POSITIONS_FILE);
+    const newPosition = {
+        id: `pos_${Date.now()}`,
+        ...data,
+        status: 'OPEN',
+        created_at: new Date().toISOString()
+    };
+    positions.push(newPosition);
+    writeJSON(POSITIONS_FILE, positions);
+    console.log(`💾 [DB] 신규 매수 기록 완료 (${data.market})`);
+    return newPosition;
+}
+
+/**
+ * [함수 3] 트레일링 스탑, 수익률 등 실시간 갱신
+ */
+async function updatePosition(id, updateData) {
+    const positions = readJSON(POSITIONS_FILE);
+    const index = positions.findIndex((p) => p.id === id);
+    if (index !== -1) {
+        positions[index] = {
+            ...positions[index],
+            ...updateData,
+            updated_at: new Date().toISOString()
+        };
+        writeJSON(POSITIONS_FILE, positions);
+        return positions[index];
+    }
+    return null;
+}
+
+/**
+ * [함수 4] 매도 완료 후 포지션 종료 및 히스토리 저장
+ */
+async function closePosition(id, exitPrice, exitReason) {
+    const positions = readJSON(POSITIONS_FILE);
+    const index = positions.findIndex((p) => p.id === id);
+
+    if (index !== -1) {
+        const closedPosition = {
+            ...positions[index],
+            exit_price: exitPrice,
+            exit_reason: exitReason,
+            status: 'CLOSED',
+            closed_at: new Date().toISOString()
+        };
+
+        // 현재 목록에서 업데이트
+        positions[index] = closedPosition;
+        writeJSON(POSITIONS_FILE, positions);
+
+        // 과거 거래 기록 파일에 따로 한 번 더 저장
+        const history = readJSON(HISTORY_FILE);
+        history.push(closedPosition);
+        writeJSON(HISTORY_FILE, history);
+
+        console.log(`🏁 [DB] 포지션 종료 및 기록 완료 (${exitReason})`);
+        return closedPosition;
+    }
+
+    return null;
+}
+
+// --- 기존 main.js와의 API 호환 함수들 ---
+async function updateOpenPosition(positionId, patch) {
+    return updatePosition(positionId, patch);
+}
 
 async function saveTrade(tradeData) {
-    const payload = {
-        is_simulated: false,
-        ...tradeData
+    const trades = readJSON(TRADES_FILE);
+    const row = {
+        id: `trade_${Date.now()}`,
+        ...tradeData,
+        is_simulated: tradeData?.is_simulated ?? false,
+        created_at: new Date().toISOString()
     };
-
-    const { data, error } = await supabase.from('quant_trades').insert([payload]);
-    if (error) console.error("❌ DB 저장 에러(trades):", error);
-    return data;
+    trades.push(row);
+    writeJSON(TRADES_FILE, trades);
+    return row;
 }
 
 async function saveAILog(logData) {
-    const payload = {
-        is_simulated: false,
-        ...logData
+    const logs = readJSON(AI_LOGS_FILE);
+    const row = {
+        id: `ai_${Date.now()}`,
+        ...logData,
+        is_simulated: logData?.is_simulated ?? false,
+        created_at: new Date().toISOString()
     };
-
-    const { data, error } = await supabase.from('quant_ai_logs').insert([payload]);
-    if (error) console.error("❌ DB 저장 에러(ai_logs):", error);
-    return data;
-}
-
-async function getOpenPosition(market = 'KRW-BTC', isSimulated = false) {
-    const { data, error } = await supabase
-        .from('quant_positions')
-        .select('*')
-        .eq('market', market)
-        .eq('status', 'OPEN')
-        .eq('is_simulated', isSimulated)
-        .order('opened_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-
-    if (error) {
-        console.error('❌ DB 조회 에러(open_position):', error);
-        return null;
-    }
-    return data;
-}
-
-async function createOpenPosition(positionData) {
-    const payload = {
-        is_simulated: false,
-        status: 'OPEN',
-        ...positionData
-    };
-
-    const { data, error } = await supabase
-        .from('quant_positions')
-        .insert([payload])
-        .select('*')
-        .single();
-
-    if (error) {
-        console.error('❌ DB 저장 에러(open_position):', error);
-        return null;
-    }
-    return data;
-}
-
-async function updateOpenPosition(positionId, patch) {
-    const { data, error } = await supabase
-        .from('quant_positions')
-        .update(patch)
-        .eq('id', positionId)
-        .eq('status', 'OPEN')
-        .select('*')
-        .maybeSingle();
-
-    if (error) {
-        console.error('❌ DB 업데이트 에러(open_position):', error);
-        return null;
-    }
-    return data;
-}
-
-async function closePosition(positionId, exitPrice, exitReason) {
-    const { data, error } = await supabase
-        .from('quant_positions')
-        .update({
-            status: 'CLOSED',
-            exit_price: exitPrice,
-            exit_reason: exitReason,
-            closed_at: new Date().toISOString()
-        })
-        .eq('id', positionId)
-        .eq('status', 'OPEN')
-        .select('*')
-        .maybeSingle();
-
-    if (error) {
-        console.error('❌ DB 종료 에러(close_position):', error);
-        return null;
-    }
-    return data;
-}
-
-async function getTradeCashflowSummary(isSimulated = false) {
-    const { data, error } = await supabase
-        .from('quant_trades')
-        .select('side,amount,is_simulated')
-        .eq('is_simulated', isSimulated);
-
-    if (error) {
-        console.error('❌ DB 조회 에러(trade_summary):', error);
-        return {
-            totalBuy: 0,
-            totalSell: 0,
-            totalInvested: 0,
-            totalEarned: 0,
-            totalLost: 0,
-            netCashflow: 0
-        };
-    }
-
-    let totalBuy = 0;
-    let totalSell = 0;
-    for (const row of data || []) {
-        const amount = Number(row.amount || 0);
-        if (row.side === 'buy') totalBuy += amount;
-        if (row.side === 'sell') totalSell += amount;
-    }
-
-    const netCashflow = totalSell - totalBuy;
-    return {
-        totalBuy,
-        totalSell,
-        totalInvested: totalBuy,
-        totalEarned: netCashflow > 0 ? netCashflow : 0,
-        totalLost: netCashflow < 0 ? Math.abs(netCashflow) : 0,
-        netCashflow
-    };
-}
-
-async function getOpenPositionsTotal(isSimulated = false) {
-    const { data, error } = await supabase
-        .from('quant_positions')
-        .select('invested_krw')
-        .eq('status', 'OPEN')
-        .eq('is_simulated', isSimulated);
-
-    if (error) {
-        console.error('❌ DB 조회 에러(open_positions_total):', error);
-        return 0;
-    }
-
-    return (data || []).reduce((sum, row) => sum + Number(row.invested_krw || 0), 0);
+    logs.push(row);
+    writeJSON(AI_LOGS_FILE, logs);
+    return row;
 }
 
 async function upsertSyncReport(reportData) {
-    const today = new Date().toISOString().slice(0, 10);
+    const reports = readJSON(SYNC_REPORTS_FILE);
+    const reportDate = reportData?.report_date || new Date().toISOString().slice(0, 10);
+    const isSimulated = reportData?.is_simulated ?? false;
+
+    const index = reports.findIndex(
+        (r) => r.report_date === reportDate && (r.is_simulated ?? false) === isSimulated
+    );
+
     const payload = {
-        report_date: reportData.report_date || today,
-        is_simulated: reportData.is_simulated ?? false,
-        checked_markets: reportData.checked_markets ?? 0,
-        mismatches: reportData.mismatches ?? 0,
-        recovered_count: reportData.recovered_count ?? 0,
-        closed_count: reportData.closed_count ?? 0,
-        qty_adjusted_count: reportData.qty_adjusted_count ?? 0,
-        details: reportData.details || null
+        ...reportData,
+        report_date: reportDate,
+        is_simulated: isSimulated,
+        updated_at: new Date().toISOString()
     };
 
-    const { data, error } = await supabase
-        .from('quant_sync_reports')
-        .upsert(payload, { onConflict: 'report_date,is_simulated' })
-        .select('*')
-        .maybeSingle();
-
-    if (error) {
-        console.error('❌ DB 저장 에러(sync_reports):', error);
-        return null;
+    if (index === -1) {
+        reports.push({ id: `sync_${Date.now()}`, ...payload, created_at: new Date().toISOString() });
+    } else {
+        reports[index] = { ...reports[index], ...payload };
     }
-    return data;
+
+    writeJSON(SYNC_REPORTS_FILE, reports);
+    return index === -1 ? reports[reports.length - 1] : reports[index];
 }
 
 module.exports = {
-    saveTrade,
-    saveAILog,
     getOpenPosition,
+    listOpenPositions,
     createOpenPosition,
+    updatePosition,
     updateOpenPosition,
     closePosition,
-    getTradeCashflowSummary,
-    getOpenPositionsTotal,
+    saveTrade,
+    saveAILog,
     upsertSyncReport
 };

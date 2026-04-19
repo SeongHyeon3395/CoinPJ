@@ -18,6 +18,7 @@ const {
     saveTrade,
     saveAILog,
     getOpenPosition,
+    listOpenPositions,
     createOpenPosition,
     updateOpenPosition,
     closePosition,
@@ -69,6 +70,10 @@ const POSITION_SYNC_ON_START = process.env.POSITION_SYNC_ON_START !== 'false';
 const POSITION_SYNC_DUST_QTY = Number(process.env.POSITION_SYNC_DUST_QTY || 0.00001);
 const SYNC_REPORT_AS_AI_LOG = process.env.SYNC_REPORT_AS_AI_LOG !== 'false';
 const AUTO_STOP_MINUTES = Number(process.env.AUTO_STOP_MINUTES || 0);
+const NEWS_CACHE_MINUTES = Number(process.env.NEWS_CACHE_MINUTES || 50);
+
+let cachedNews = null;
+let lastNewsFetchTime = 0;
 
 if (MIN_STOP_PCT_INPUT < MIN_STOP_PCT_FLOOR) {
     console.log(`⚠️ MIN_STOP_PCT=${MIN_STOP_PCT_INPUT}% 가 너무 낮아 ${MIN_STOP_PCT}%로 상향 보정했습니다.`);
@@ -172,14 +177,6 @@ async function getSurgingAltMarkets(baseMarkets) {
             .slice(0, SURGING_ALT_COUNT)
             .map((t) => t.market);
 
-        if (picked.length > 0) {
-            const byMarket = new Map(tickerList.map((t) => [t.market, t]));
-            const summary = picked
-                .map((m) => `${m}(${((byMarket.get(m)?.signed_change_rate || 0) * 100).toFixed(2)}%)`)
-                .join(', ');
-            console.log(`🔥 급등 잡코인 스캔 결과: ${summary}`);
-        }
-
         return picked;
     } catch (error) {
         console.error('⚠️ 급등 잡코인 스캔 실패, 고정 마켓만 사용합니다:', error.response?.data || error.message);
@@ -187,10 +184,34 @@ async function getSurgingAltMarkets(baseMarkets) {
     }
 }
 
-async function resolveTargetMarkets() {
+async function resolveTargetMarkets(includeOpenPositionMarkets = true) {
     const baseMarkets = uniqueMarkets(TARGET_MARKETS);
     const surgingAltMarkets = await getSurgingAltMarkets(baseMarkets);
-    return uniqueMarkets([...baseMarkets, ...surgingAltMarkets]);
+    const markets = uniqueMarkets([...baseMarkets, ...surgingAltMarkets]);
+
+    if (!includeOpenPositionMarkets) {
+        return markets;
+    }
+
+    const openPositions = await listOpenPositions();
+    const openMarkets = uniqueMarkets((openPositions || []).map((p) => p.market));
+    return uniqueMarkets([...markets, ...openMarkets]);
+}
+
+async function getSharedNews() {
+    const now = Date.now();
+    const cacheTtlMs = Math.max(1, NEWS_CACHE_MINUTES) * 60 * 1000;
+
+    if (cachedNews && (now - lastNewsFetchTime) < cacheTtlMs) {
+        console.log('♻️ 기존 뉴스를 재사용합니다. (Tavily 호출 절약)');
+        return cachedNews;
+    }
+
+    console.log('🔍 최신 뉴스 수집 중... (공통 1회)');
+    const news = await getCryptoNews('KRW-BTC');
+    cachedNews = news;
+    lastNewsFetchTime = now;
+    return news;
 }
 
 function parseOrderExecution(order, fallbackPrice = 0, fallbackVolume = 0) {
@@ -588,9 +609,8 @@ async function runBot() {
         const tickersRes = await axios.get(`https://api.upbit.com/v1/ticker?markets=${activeMarkets.join(',')}`);
         const tickerByMarket = new Map(tickersRes.data.map((t) => [t.market, t]));
 
-        // 무료 Tavily 한도를 고려해 뉴스는 1회 수집 후 모든 마켓에 공통 반영한다.
-        console.log('🔍 최신 뉴스 수집 중... (공통 1회)');
-        const sharedNews = await getCryptoNews('KRW-BTC');
+        // 뉴스는 캐시 기반으로 재사용하고 TTL 이후에만 재수집한다.
+        const sharedNews = await getSharedNews();
 
         for (const market of activeMarkets) {
             const ticker = tickerByMarket.get(market);

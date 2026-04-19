@@ -7,7 +7,14 @@ function getAssetContext(market) {
         'KRW-ETH': { symbol: 'ETH', english: 'ethereum', korean: '이더리움' },
         'KRW-XRP': { symbol: 'XRP', english: 'ripple', korean: '리플' }
     };
-    return mapping[market] || { symbol: market.replace('KRW-', ''), english: 'crypto', korean: market };
+    if (mapping[market]) return mapping[market];
+
+    const symbol = market.replace('KRW-', '');
+    return {
+        symbol,
+        english: `${symbol.toLowerCase()} crypto`,
+        korean: `${symbol} 코인`
+    };
 }
 
 function clamp(value, min, max) {
@@ -200,6 +207,7 @@ async function requestGeminiSingleModel(payload) {
 
 async function getAIDecision(currentPrice, news, chartData, technicalSignal, market = 'KRW-BTC') {
     const asset = getAssetContext(market);
+    const candleUnit = Number(process.env.CHART_CANDLE_UNIT_MINUTES || 60);
 
     const chartString = (chartData || []).slice(-12).map((d) => (
         `${d.time}: O=${d.open}, H=${d.high}, L=${d.low}, C=${d.close}, V=${d.vol.toFixed(2)}`
@@ -213,7 +221,7 @@ async function getAIDecision(currentPrice, news, chartData, technicalSignal, mar
         [최신 시장 뉴스]:
         ${news}
 
-        [최근 1시간봉 12개 OHLCV]:
+        [최근 ${candleUnit}분봉 12개 OHLCV]:
         ${chartString || '차트 데이터 없음'}
 
         [기술 신호 요약(JSON)]:
