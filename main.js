@@ -199,9 +199,23 @@ async function getTickerByMarketSafe(markets, contextLabel = '동기화') {
     const tickerByMarket = new Map();
     if (!markets.length) return tickerByMarket;
 
+    let queryMarkets = markets;
+    const knownKrwMarketSet = await getKnownKrwMarketSet();
+    if (knownKrwMarketSet && knownKrwMarketSet.size > 0) {
+        const invalidByCatalog = markets.filter((m) => !knownKrwMarketSet.has(m));
+        if (invalidByCatalog.length > 0) {
+            console.error(`⚠️ ${contextLabel} 지원하지 않는 마켓 코드 제외: ${invalidByCatalog.join(', ')}`);
+        }
+        queryMarkets = markets.filter((m) => knownKrwMarketSet.has(m));
+    }
+
+    if (!queryMarkets.length) {
+        return tickerByMarket;
+    }
+
     try {
         const tickerRes = await axios.get('https://api.upbit.com/v1/ticker', {
-            params: { markets: markets.join(',') }
+            params: { markets: queryMarkets.join(',') }
         });
 
         for (const t of tickerRes.data || []) {
@@ -221,7 +235,7 @@ async function getTickerByMarketSafe(markets, contextLabel = '동기화') {
         console.error(`⚠️ ${contextLabel} 티커 일괄 조회 404. 개별 마켓 재시도 후 유효 마켓만 반영합니다:`, detail);
         const invalidMarkets = [];
 
-        for (const market of markets) {
+        for (const market of queryMarkets) {
             try {
                 const singleTicker = await axios.get('https://api.upbit.com/v1/ticker', {
                     params: { markets: market }
@@ -231,10 +245,18 @@ async function getTickerByMarketSafe(markets, contextLabel = '동기화') {
                     tickerByMarket.set(first.market, Number(first.trade_price || 0));
                 }
             } catch (singleError) {
+                const singleStatus = singleError.response?.status;
+                const singleName = singleError.response?.data?.name;
                 if (singleError.response?.status === 404) {
                     invalidMarkets.push(market);
                     continue;
                 }
+
+                if (singleStatus === 429 || singleName === 'too_many_requests') {
+                    console.error(`⚠️ ${contextLabel} 티커 개별 조회 레이트리밋으로 재시도를 중단합니다.`);
+                    break;
+                }
+
                 console.error(`⚠️ ${contextLabel} 티커 조회 실패(${market}):`, singleError.response?.data || singleError.message);
             }
         }
@@ -1008,6 +1030,34 @@ let isRunning = false;
 let isMonitorRunning = false;
 let isSyncRunning = false;
 let hasCompletedInitialSync = !BLOCK_TRADING_UNTIL_SYNC;
+let cachedKrwMarketSet = null;
+let lastKrwMarketSetFetchedAt = 0;
+
+async function getKnownKrwMarketSet() {
+    const cacheMs = 10 * 60 * 1000;
+    const now = Date.now();
+
+    if (cachedKrwMarketSet && (now - lastKrwMarketSetFetchedAt) < cacheMs) {
+        return cachedKrwMarketSet;
+    }
+
+    try {
+        const marketRes = await axios.get('https://api.upbit.com/v1/market/all', {
+            params: { isDetails: false }
+        });
+
+        cachedKrwMarketSet = new Set(
+            (marketRes.data || [])
+                .map((m) => m.market)
+                .filter((m) => typeof m === 'string' && m.startsWith('KRW-'))
+        );
+        lastKrwMarketSetFetchedAt = now;
+        return cachedKrwMarketSet;
+    } catch (error) {
+        console.error('⚠️ KRW 마켓 목록 조회 실패. 티커 조회를 원본 목록으로 진행합니다:', error.response?.data || error.message);
+        return null;
+    }
+}
 
 async function runBotSafely() {
     if (BLOCK_TRADING_UNTIL_SYNC && !hasCompletedInitialSync) {
