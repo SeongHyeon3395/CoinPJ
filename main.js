@@ -49,6 +49,7 @@ const AGGRESSIVE_TEST_MODE = process.env.AGGRESSIVE_TEST_MODE !== 'false';
 const ENTRY_SCORE_THRESHOLD = Number(process.env.ENTRY_SCORE_THRESHOLD || 55);
 const EXIT_SCORE_THRESHOLD = Number(process.env.EXIT_SCORE_THRESHOLD || 45);
 const TECH_MIN_CONFIDENCE = Number(process.env.TECH_MIN_CONFIDENCE || 35);
+const INCLUDE_ACCOUNT_HOLDINGS_MARKETS = process.env.INCLUDE_ACCOUNT_HOLDINGS_MARKETS !== 'false';
 const TARGET_MARKETS = (process.env.TARGET_MARKETS || 'KRW-BTC,KRW-ETH,KRW-XRP')
     .split(',')
     .map((m) => m.trim())
@@ -181,10 +182,37 @@ async function getSurgingAltMarkets(baseMarkets) {
     }
 }
 
+async function getAccountHoldingMarkets() {
+    if (DRY_RUN || !INCLUDE_ACCOUNT_HOLDINGS_MARKETS) {
+        return [];
+    }
+
+    try {
+        const accounts = await getAccounts();
+        const holdingMarkets = (accounts || [])
+            .filter((a) => a.unit_currency === 'KRW' && a.currency !== 'KRW')
+            .map((a) => {
+                const qty = Number(a.balance || 0) + Number(a.locked || 0);
+                return {
+                    market: `KRW-${a.currency}`,
+                    qty
+                };
+            })
+            .filter((h) => h.qty > POSITION_SYNC_DUST_QTY)
+            .map((h) => h.market);
+
+        return uniqueMarkets(holdingMarkets);
+    } catch (error) {
+        console.error('⚠️ 실계좌 보유 마켓 조회 실패, 기본 대상만 사용합니다:', error.response?.data || error.message);
+        return [];
+    }
+}
+
 async function resolveTargetMarkets(includeOpenPositionMarkets = true) {
     const baseMarkets = uniqueMarkets(TARGET_MARKETS);
     const surgingAltMarkets = await getSurgingAltMarkets(baseMarkets);
-    const markets = uniqueMarkets([...baseMarkets, ...surgingAltMarkets]);
+    const holdingMarkets = await getAccountHoldingMarkets();
+    const markets = uniqueMarkets([...baseMarkets, ...surgingAltMarkets, ...holdingMarkets]);
 
     if (!includeOpenPositionMarkets) {
         return markets;
