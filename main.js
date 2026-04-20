@@ -644,8 +644,13 @@ async function runBot() {
             return;
         }
 
-        const tickersRes = await axios.get(`https://api.upbit.com/v1/ticker?markets=${activeMarkets.join(',')}`);
-        const tickerByMarket = new Map(tickersRes.data.map((t) => [t.market, t]));
+        const tickerPriceByMarket = await getTickerByMarketSafe(activeMarkets, '매매 루프');
+        const tickerByMarket = new Map(
+            [...tickerPriceByMarket.entries()].map(([market, tradePrice]) => [
+                market,
+                { market, trade_price: tradePrice }
+            ])
+        );
         const accountByCurrency = DRY_RUN
             ? new Map()
             : new Map((await getAccounts()).map((a) => [a.currency, a]));
@@ -1030,8 +1035,13 @@ async function runPriceMonitor() {
             return;
         }
 
-        const tickersRes = await axios.get(`https://api.upbit.com/v1/ticker?markets=${activeMarkets.join(',')}`);
-        const tickerByMarket = new Map(tickersRes.data.map((t) => [t.market, t]));
+        const tickerPriceByMarket = await getTickerByMarketSafe(activeMarkets, '가격 모니터링');
+        const tickerByMarket = new Map(
+            [...tickerPriceByMarket.entries()].map(([market, tradePrice]) => [
+                market,
+                { market, trade_price: tradePrice }
+            ])
+        );
 
         for (const market of activeMarkets) {
             const openPosition = await getOpenPosition(market, DRY_RUN);
