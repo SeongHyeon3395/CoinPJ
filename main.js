@@ -49,7 +49,6 @@ const AGGRESSIVE_TEST_MODE = process.env.AGGRESSIVE_TEST_MODE !== 'false';
 const ENTRY_SCORE_THRESHOLD = Number(process.env.ENTRY_SCORE_THRESHOLD || 55);
 const EXIT_SCORE_THRESHOLD = Number(process.env.EXIT_SCORE_THRESHOLD || 45);
 const TECH_MIN_CONFIDENCE = Number(process.env.TECH_MIN_CONFIDENCE || 35);
-const INCLUDE_ACCOUNT_HOLDINGS_MARKETS = process.env.INCLUDE_ACCOUNT_HOLDINGS_MARKETS !== 'false';
 const TARGET_MARKETS = (process.env.TARGET_MARKETS || 'KRW-BTC,KRW-ETH,KRW-XRP')
     .split(',')
     .map((m) => m.trim())
@@ -182,92 +181,10 @@ async function getSurgingAltMarkets(baseMarkets) {
     }
 }
 
-async function getAccountHoldingMarkets() {
-    if (DRY_RUN || !INCLUDE_ACCOUNT_HOLDINGS_MARKETS) {
-        return [];
-    }
-
-    try {
-        const accounts = await getAccounts();
-        const holdingMarkets = (accounts || [])
-            .filter((a) => a.unit_currency === 'KRW' && a.currency !== 'KRW')
-            .map((a) => {
-                const qty = Number(a.balance || 0) + Number(a.locked || 0);
-                return {
-                    market: `KRW-${a.currency}`,
-                    qty
-                };
-            })
-            .filter((h) => h.qty > POSITION_SYNC_DUST_QTY)
-            .map((h) => h.market);
-
-        return uniqueMarkets(holdingMarkets);
-    } catch (error) {
-        console.error('⚠️ 실계좌 보유 마켓 조회 실패, 기본 대상만 사용합니다:', error.response?.data || error.message);
-        return [];
-    }
-}
-
-async function fetchTickerByMarkets(markets, context = 'general') {
-    const validMarkets = uniqueMarkets(markets);
-    const tickerByMarket = new Map();
-
-    if (!validMarkets.length) {
-        return tickerByMarket;
-    }
-
-    try {
-        const tickersRes = await axios.get('https://api.upbit.com/v1/ticker', {
-            params: { markets: validMarkets.join(',') }
-        });
-        for (const t of tickersRes.data || []) {
-            if (t?.market) tickerByMarket.set(t.market, t);
-        }
-        return tickerByMarket;
-    } catch (error) {
-        const status = error.response?.status;
-        const detail = error.response?.data || error.message;
-
-        if (status !== 404) {
-            throw error;
-        }
-
-        console.error(`⚠️ [${context}] 티커 일괄 조회 404, 개별 마켓으로 재시도합니다:`, detail);
-        const invalidMarkets = [];
-
-        for (const market of validMarkets) {
-            try {
-                const res = await axios.get('https://api.upbit.com/v1/ticker', {
-                    params: { markets: market }
-                });
-                const first = Array.isArray(res.data) ? res.data[0] : null;
-                if (first?.market) {
-                    tickerByMarket.set(first.market, first);
-                } else {
-                    invalidMarkets.push(market);
-                }
-            } catch (singleError) {
-                if (singleError.response?.status === 404) {
-                    invalidMarkets.push(market);
-                    continue;
-                }
-                console.error(`⚠️ [${context}] 티커 조회 실패(${market}):`, singleError.response?.data || singleError.message);
-            }
-        }
-
-        if (invalidMarkets.length > 0) {
-            console.error(`⚠️ [${context}] 유효하지 않은 마켓 제외: ${invalidMarkets.join(', ')}`);
-        }
-
-        return tickerByMarket;
-    }
-}
-
 async function resolveTargetMarkets(includeOpenPositionMarkets = true) {
     const baseMarkets = uniqueMarkets(TARGET_MARKETS);
     const surgingAltMarkets = await getSurgingAltMarkets(baseMarkets);
-    const holdingMarkets = await getAccountHoldingMarkets();
-    const markets = uniqueMarkets([...baseMarkets, ...surgingAltMarkets, ...holdingMarkets]);
+    const markets = uniqueMarkets([...baseMarkets, ...surgingAltMarkets]);
 
     if (!includeOpenPositionMarkets) {
         return markets;
@@ -507,10 +424,8 @@ async function reconcilePositions() {
         return report;
     }
 
-    const tickerRawByMarket = await fetchTickerByMarkets(activeMarkets, 'position-sync');
-    const tickerByMarket = new Map(
-        [...tickerRawByMarket.entries()].map(([market, ticker]) => [market, Number(ticker?.trade_price || 0)])
-    );
+    const tickerRes = await axios.get(`https://api.upbit.com/v1/ticker?markets=${activeMarkets.join(',')}`);
+    const tickerByMarket = new Map((tickerRes.data || []).map((t) => [t.market, Number(t.trade_price || 0)]));
 
     for (const market of activeMarkets) {
         report.checkedMarkets += 1;
@@ -672,7 +587,8 @@ async function runBot() {
             return;
         }
 
-        const tickerByMarket = await fetchTickerByMarkets(activeMarkets, 'run-bot');
+        const tickersRes = await axios.get(`https://api.upbit.com/v1/ticker?markets=${activeMarkets.join(',')}`);
+        const tickerByMarket = new Map(tickersRes.data.map((t) => [t.market, t]));
         const accountByCurrency = DRY_RUN
             ? new Map()
             : new Map((await getAccounts()).map((a) => [a.currency, a]));
@@ -1057,7 +973,8 @@ async function runPriceMonitor() {
             return;
         }
 
-        const tickerByMarket = await fetchTickerByMarkets(activeMarkets, 'price-monitor');
+        const tickersRes = await axios.get(`https://api.upbit.com/v1/ticker?markets=${activeMarkets.join(',')}`);
+        const tickerByMarket = new Map(tickersRes.data.map((t) => [t.market, t]));
 
         for (const market of activeMarkets) {
             const openPosition = await getOpenPosition(market, DRY_RUN);
