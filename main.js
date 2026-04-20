@@ -2,7 +2,7 @@
 require('dotenv').config();
 const axios = require('axios');
 const cron = require('node-cron');
-const { getCryptoNews, getChartData, getTechnicalSignal, getAIDecision } = require('./logic');
+const { getChartData, getTechnicalSignal, getAIDecision } = require('./logic');
 const {
     buyMarket,
     sellMarket,
@@ -71,10 +71,6 @@ const BLOCK_TRADING_UNTIL_SYNC = process.env.BLOCK_TRADING_UNTIL_SYNC !== 'false
 const POSITION_SYNC_DUST_QTY = Number(process.env.POSITION_SYNC_DUST_QTY || 0.00001);
 const SYNC_REPORT_AS_AI_LOG = process.env.SYNC_REPORT_AS_AI_LOG !== 'false';
 const AUTO_STOP_MINUTES = Number(process.env.AUTO_STOP_MINUTES || 0);
-const NEWS_CACHE_MINUTES = Number(process.env.NEWS_CACHE_MINUTES || 50);
-
-let cachedNews = null;
-let lastNewsFetchTime = 0;
 
 if (MIN_STOP_PCT_INPUT < MIN_STOP_PCT_FLOOR) {
     console.log(`⚠️ MIN_STOP_PCT=${MIN_STOP_PCT_INPUT}% 가 너무 낮아 ${MIN_STOP_PCT}%로 상향 보정했습니다.`);
@@ -197,22 +193,6 @@ async function resolveTargetMarkets(includeOpenPositionMarkets = true) {
     const openPositions = await listOpenPositions();
     const openMarkets = uniqueMarkets((openPositions || []).map((p) => p.market));
     return uniqueMarkets([...markets, ...openMarkets]);
-}
-
-async function getSharedNews() {
-    const now = Date.now();
-    const cacheTtlMs = Math.max(1, NEWS_CACHE_MINUTES) * 60 * 1000;
-
-    if (cachedNews && (now - lastNewsFetchTime) < cacheTtlMs) {
-        console.log('♻️ 기존 뉴스를 재사용합니다. (Tavily 호출 절약)');
-        return cachedNews;
-    }
-
-    console.log('🔍 최신 뉴스 수집 중... (공통 1회)');
-    const news = await getCryptoNews('KRW-BTC');
-    cachedNews = news;
-    lastNewsFetchTime = now;
-    return news;
 }
 
 function parseOrderExecution(order, fallbackPrice = 0, fallbackVolume = 0) {
@@ -613,8 +593,7 @@ async function runBot() {
             ? new Map()
             : new Map((await getAccounts()).map((a) => [a.currency, a]));
 
-        // 뉴스는 캐시 기반으로 재사용하고 TTL 이후에만 재수집한다.
-        const sharedNews = await getSharedNews();
+        const sharedNews = '';
 
         for (const market of activeMarkets) {
             const ticker = tickerByMarket.get(market);
