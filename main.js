@@ -195,6 +195,58 @@ async function resolveTargetMarkets(includeOpenPositionMarkets = true) {
     return uniqueMarkets([...markets, ...openMarkets]);
 }
 
+async function getTickerByMarketSafe(markets, contextLabel = '동기화') {
+    const tickerByMarket = new Map();
+    if (!markets.length) return tickerByMarket;
+
+    try {
+        const tickerRes = await axios.get('https://api.upbit.com/v1/ticker', {
+            params: { markets: markets.join(',') }
+        });
+
+        for (const t of tickerRes.data || []) {
+            tickerByMarket.set(t.market, Number(t.trade_price || 0));
+        }
+
+        return tickerByMarket;
+    } catch (error) {
+        const status = error.response?.status;
+        const detail = error.response?.data || error.message;
+
+        if (status !== 404) {
+            console.error(`⚠️ ${contextLabel} 티커 일괄 조회 실패:`, detail);
+            return tickerByMarket;
+        }
+
+        console.error(`⚠️ ${contextLabel} 티커 일괄 조회 404. 개별 마켓 재시도 후 유효 마켓만 반영합니다:`, detail);
+        const invalidMarkets = [];
+
+        for (const market of markets) {
+            try {
+                const singleTicker = await axios.get('https://api.upbit.com/v1/ticker', {
+                    params: { markets: market }
+                });
+                const first = Array.isArray(singleTicker.data) ? singleTicker.data[0] : null;
+                if (first?.market) {
+                    tickerByMarket.set(first.market, Number(first.trade_price || 0));
+                }
+            } catch (singleError) {
+                if (singleError.response?.status === 404) {
+                    invalidMarkets.push(market);
+                    continue;
+                }
+                console.error(`⚠️ ${contextLabel} 티커 조회 실패(${market}):`, singleError.response?.data || singleError.message);
+            }
+        }
+
+        if (invalidMarkets.length > 0) {
+            console.error(`⚠️ ${contextLabel} 조회 불가 마켓 제외: ${invalidMarkets.join(', ')}`);
+        }
+
+        return tickerByMarket;
+    }
+}
+
 function parseOrderExecution(order, fallbackPrice = 0, fallbackVolume = 0) {
     const executedVolume = Number(order?.executed_volume || fallbackVolume || 0);
     const paidFee = Number(order?.paid_fee || 0);
@@ -413,7 +465,8 @@ async function reconcilePositions() {
         mismatches: 0,
         recoveredCount: 0,
         closedCount: 0,
-        qtyAdjustedCount: 0
+        qtyAdjustedCount: 0,
+        syncErrorCount: 0
     };
 
     const accounts = await getAccounts();
@@ -424,72 +477,76 @@ async function reconcilePositions() {
         return report;
     }
 
-    const tickerRes = await axios.get(`https://api.upbit.com/v1/ticker?markets=${activeMarkets.join(',')}`);
-    const tickerByMarket = new Map((tickerRes.data || []).map((t) => [t.market, Number(t.trade_price || 0)]));
+    const tickerByMarket = await getTickerByMarketSafe(activeMarkets, '포지션 동기화');
 
     for (const market of activeMarkets) {
-        report.checkedMarkets += 1;
-        const dbPosition = await getOpenPosition(market, DRY_RUN);
-        const currency = getBaseCurrency(market);
-        const account = accountByCurrency.get(currency);
+        try {
+            report.checkedMarkets += 1;
+            const dbPosition = await getOpenPosition(market, DRY_RUN);
+            const currency = getBaseCurrency(market);
+            const account = accountByCurrency.get(currency);
 
-        const balance = Number(account?.balance || 0);
-        const locked = Number(account?.locked || 0);
-        const actualQty = balance + locked;
-        const currentPrice = tickerByMarket.get(market) || 0;
-        const avgBuyPrice = Number(account?.avg_buy_price || 0);
+            const balance = Number(account?.balance || 0);
+            const locked = Number(account?.locked || 0);
+            const actualQty = balance + locked;
+            const currentPrice = tickerByMarket.get(market) || 0;
+            const avgBuyPrice = Number(account?.avg_buy_price || 0);
 
-        if (actualQty > POSITION_SYNC_DUST_QTY && !dbPosition) {
-            report.mismatches += 1;
-            report.recoveredCount += 1;
-            const entryPrice = avgBuyPrice > 0 ? avgBuyPrice : currentPrice;
-            const trailDistance = computeTrailingDistance(entryPrice, null);
-            const trailingStop = Math.max(entryPrice - trailDistance, 1);
-
-            await createOpenPosition({
-                market,
-                entry_price: entryPrice,
-                quantity_btc: actualQty,
-                invested_krw: actualQty * entryPrice,
-                highest_price: currentPrice > 0 ? currentPrice : entryPrice,
-                trailing_stop_price: trailingStop,
-                atr_at_entry: null,
-                entry_reason: `[${market}] SYSTEM_RECOVERY: 실계좌 보유분을 DB에 복구`,
-                is_simulated: DRY_RUN,
-                take_profit_done: false
-            });
-
-            console.log(`✅ 동기화 복구(${market}): 실계좌 보유분을 DB OPEN 포지션으로 생성`);
-            continue;
-        }
-
-        if (actualQty <= POSITION_SYNC_DUST_QTY && dbPosition) {
-            report.mismatches += 1;
-            report.closedCount += 1;
-            const exitPrice = currentPrice > 0 ? currentPrice : Number(dbPosition.entry_price);
-            await closePosition(dbPosition.id, exitPrice, `[${market}] SYSTEM_SYNC: 실계좌 잔고 없음으로 포지션 종료`);
-            console.log(`✅ 동기화 정리(${market}): DB OPEN 포지션을 종료`);
-            continue;
-        }
-
-        if (actualQty > POSITION_SYNC_DUST_QTY && dbPosition) {
-            const dbQty = Number(dbPosition.quantity_btc || 0);
-            const qtyGap = Math.abs(actualQty - dbQty);
-            const tolerance = Math.max(POSITION_SYNC_DUST_QTY, actualQty * 0.02);
-
-            if (qtyGap > tolerance) {
+            if (actualQty > POSITION_SYNC_DUST_QTY && !dbPosition) {
                 report.mismatches += 1;
-                report.qtyAdjustedCount += 1;
-                await updateOpenPosition(dbPosition.id, {
+                report.recoveredCount += 1;
+                const entryPrice = avgBuyPrice > 0 ? avgBuyPrice : currentPrice;
+                const trailDistance = computeTrailingDistance(entryPrice, null);
+                const trailingStop = Math.max(entryPrice - trailDistance, 1);
+
+                await createOpenPosition({
+                    market,
+                    entry_price: entryPrice,
                     quantity_btc: actualQty,
-                    invested_krw: actualQty * Number(dbPosition.entry_price)
+                    invested_krw: actualQty * entryPrice,
+                    highest_price: currentPrice > 0 ? currentPrice : entryPrice,
+                    trailing_stop_price: trailingStop,
+                    atr_at_entry: null,
+                    entry_reason: `[${market}] SYSTEM_RECOVERY: 실계좌 보유분을 DB에 복구`,
+                    is_simulated: DRY_RUN,
+                    take_profit_done: false
                 });
-                console.log(`✅ 동기화 보정(${market}): 수량 차이 ${qtyGap.toFixed(8)}를 DB에 반영`);
+
+                console.log(`✅ 동기화 복구(${market}): 실계좌 보유분을 DB OPEN 포지션으로 생성`);
+                continue;
             }
+
+            if (actualQty <= POSITION_SYNC_DUST_QTY && dbPosition) {
+                report.mismatches += 1;
+                report.closedCount += 1;
+                const exitPrice = currentPrice > 0 ? currentPrice : Number(dbPosition.entry_price);
+                await closePosition(dbPosition.id, exitPrice, `[${market}] SYSTEM_SYNC: 실계좌 잔고 없음으로 포지션 종료`);
+                console.log(`✅ 동기화 정리(${market}): DB OPEN 포지션을 종료`);
+                continue;
+            }
+
+            if (actualQty > POSITION_SYNC_DUST_QTY && dbPosition) {
+                const dbQty = Number(dbPosition.quantity_btc || 0);
+                const qtyGap = Math.abs(actualQty - dbQty);
+                const tolerance = Math.max(POSITION_SYNC_DUST_QTY, actualQty * 0.02);
+
+                if (qtyGap > tolerance) {
+                    report.mismatches += 1;
+                    report.qtyAdjustedCount += 1;
+                    await updateOpenPosition(dbPosition.id, {
+                        quantity_btc: actualQty,
+                        invested_krw: actualQty * Number(dbPosition.entry_price)
+                    });
+                    console.log(`✅ 동기화 보정(${market}): 수량 차이 ${qtyGap.toFixed(8)}를 DB에 반영`);
+                }
+            }
+        } catch (marketError) {
+            report.syncErrorCount += 1;
+            console.error(`❌ 동기화 처리 실패(${market}):`, marketError.response?.data || marketError.message);
         }
     }
 
-    const details = `checked=${report.checkedMarkets}, mismatches=${report.mismatches}, recovered=${report.recoveredCount}, closed=${report.closedCount}, adjusted=${report.qtyAdjustedCount}`;
+    const details = `checked=${report.checkedMarkets}, mismatches=${report.mismatches}, recovered=${report.recoveredCount}, closed=${report.closedCount}, adjusted=${report.qtyAdjustedCount}, errors=${report.syncErrorCount}`;
     await upsertSyncReport({
         report_date: new Date().toISOString().slice(0, 10),
         is_simulated: DRY_RUN,
@@ -1192,6 +1249,9 @@ async function runReconciliationSafely() {
         return true;
     } catch (err) {
         console.error('❌ 포지션 동기화 점검 중 오류:', err.response?.data || err.message);
+        if (err?.stack) {
+            console.error(err.stack);
+        }
         return false;
     } finally {
         isSyncRunning = false;
